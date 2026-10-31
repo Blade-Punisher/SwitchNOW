@@ -26,7 +26,8 @@ void RecordLatency(std::array<std::atomic<uint64_t>, 10>& buckets, uint64_t late
     buckets[bucket].fetch_add(1, std::memory_order_relaxed);
 }
 
-uint64_t LatencyPercentile95(const std::array<std::atomic<uint64_t>, 10>& buckets)
+static uint64_t LatencyPercentile(
+    const std::array<std::atomic<uint64_t>, 10>& buckets, uint64_t percent)
 {
     uint64_t total = 0;
     for (const auto& bucket : buckets)
@@ -34,7 +35,7 @@ uint64_t LatencyPercentile95(const std::array<std::atomic<uint64_t>, 10>& bucket
     if (total == 0)
         return 0;
 
-    const uint64_t target = (total * 95 + 99) / 100;
+    const uint64_t target = (total * percent + 99) / 100;
     uint64_t accumulated = 0;
     for (size_t i = 0; i < buckets.size(); ++i) {
         accumulated += buckets[i].load(std::memory_order_relaxed);
@@ -42,6 +43,16 @@ uint64_t LatencyPercentile95(const std::array<std::atomic<uint64_t>, 10>& bucket
             return i < kVideoLatencyThresholdsUs.size() ? kVideoLatencyThresholdsUs[i] : 50001;
     }
     return 50001;
+}
+
+uint64_t LatencyPercentile95(const std::array<std::atomic<uint64_t>, 10>& buckets)
+{
+    return LatencyPercentile(buckets, 95);
+}
+
+uint64_t LatencyPercentile99(const std::array<std::atomic<uint64_t>, 10>& buckets)
+{
+    return LatencyPercentile(buckets, 99);
 }
 
 

@@ -1,0 +1,10 @@
+Epic Games shared auto-login profile - R70
+Configure this profile from a game page with the Epic store selected. Fortnite is excluded.
+Credentials: sdmc:/switch/SwitchNOW/Epic/Epic.txt
+Format: email=YOUR_EMAIL on the first line, password=YOUR_PASSWORD on the second.
+This file is plain text. Never send it with a bug report.
+Open Epic's first email screen. Hold Minus + R3 for 0.3s, then press X.
+Choose the Epic Games account if a game-account selector appears. B cancels.
+2FA codes, CAPTCHA and verification require manual action. For sign-in without a manual code, 2FA must be disabled in Epic account settings.
+The helper always clears and replaces email. It does not read or compare the existing text.
+Only the supplied 16:9 window layout is recognised; unknown screens stop the helper.

@@ -16,6 +16,7 @@ namespace opennow::webrtc::internal
 bool StartsWith(const std::string& value, const char* prefix);
 void RecordLatency(std::array<std::atomic<uint64_t>, 10>& buckets, uint64_t latency_us);
 uint64_t LatencyPercentile95(const std::array<std::atomic<uint64_t>, 10>& buckets);
+uint64_t LatencyPercentile99(const std::array<std::atomic<uint64_t>, 10>& buckets);
 
 template <typename T>
 void AtomicMax(std::atomic<T>& target, T value)
@@ -32,7 +33,10 @@ uint64_t NowUs();
 
 void AppendInputLog(const std::string& line);
 void AppendStreamLog(const std::string& line);
-void ResetStreamTraceLog();
+void AppendLibPeerLog(const char* line, bool input_relevant);
+uint64_t ResetStreamTraceLog(const std::string& session_id);
+void FlushDiagnosticLogs();
+void RequestDiagnosticFlush();
 void AppendTraceLog(const std::string& line);
 void AppendTraceBlock(const std::string& title, const std::string& body);
 std::string PreviewText(const std::string& value, size_t max_chars = 160);

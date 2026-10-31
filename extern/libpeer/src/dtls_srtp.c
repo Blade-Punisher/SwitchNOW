@@ -487,25 +487,21 @@ void dtls_srtp_reset_session(DtlsSrtp* dtls_srtp) {
 }
 
 int dtls_srtp_write(DtlsSrtp* dtls_srtp, const unsigned char* buf, size_t len) {
-  int ret;
-
-  do {
-    ret = mbedtls_ssl_write(&dtls_srtp->ssl, buf, len);
-
-  } while (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE);
-  return ret;
+  // A WANT result is temporary, but retrying it indefinitely stalls the
+  // shared media/input worker. usrsctp can retry a failed output packet.
+  for (int attempt = 0; attempt < 4; ++attempt) {
+    const int ret = mbedtls_ssl_write(&dtls_srtp->ssl, buf, len);
+    if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE)
+      return ret;
+  }
+  return MBEDTLS_ERR_SSL_WANT_WRITE;
 }
 
 int dtls_srtp_read(DtlsSrtp* dtls_srtp, unsigned char* buf, size_t len) {
-  int ret;
-
   memset(buf, 0, len);
-
-  do {
-    ret = mbedtls_ssl_read(&dtls_srtp->ssl, buf, len);
-
-  } while (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE);
-  return ret;
+  // The caller drives this again on the next datagram. Do not wait for a
+  // future packet while holding the peer mutex and starving controller TX.
+  return mbedtls_ssl_read(&dtls_srtp->ssl, buf, len);
 }
 
 int dtls_srtp_probe(uint8_t* buf) {

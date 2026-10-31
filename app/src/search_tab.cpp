@@ -1,3 +1,5 @@
+#include "localization.hpp"
+#include "game_feed_policy.hpp"
 #include "search_tab.hpp"
 
 #include "app_state.hpp"
@@ -70,18 +72,18 @@ SearchTab::SearchTab()
     setPadding(28, 40, 28, 40);
 
     auto* header = new brls::Header();
-    header->setTitle("Search");
+    header->setTitle(opennow::Tr("Search"));
     header->setSubtitle("Search your Library and the GeForce NOW Store. Y searches, X refreshes cached data.");
     addView(header);
 
-    status_label_ = MakeParagraph("Press Y to search games. Press X to refresh Store/Library data.");
+    status_label_ = MakeParagraph(opennow::Tr("Press Y to search games. Press X to refresh Store/Library data."));
     addView(status_label_);
 
     auto* actions = new brls::Box(brls::Axis::ROW);
     actions->setMarginBottom(14);
 
     search_button_ = new brls::Button();
-    search_button_->setText("Search games");
+    search_button_->setText(opennow::Tr("Search games"));
     search_button_->setStyle(&brls::BUTTONSTYLE_PRIMARY);
     search_button_->setFocusable(false);
     search_button_->setMarginRight(12);
@@ -93,7 +95,7 @@ SearchTab::SearchTab()
     actions->addView(search_button_);
 
     refresh_button_ = new brls::Button();
-    refresh_button_->setText("Refresh search data");
+    refresh_button_->setText(opennow::Tr("Refresh search data"));
     refresh_button_->setFocusable(false);
     refresh_button_->registerClickAction([this](brls::View* view) {
         (void)view;
@@ -112,13 +114,13 @@ SearchTab::SearchTab()
     scrolling_frame_->setContentView(results_container_);
     addView(scrolling_frame_);
 
-    registerAction("Search", brls::BUTTON_Y, [this](brls::View* view) {
+    registerAction(opennow::Tr("Search"), brls::BUTTON_Y, [this](brls::View* view) {
         (void)view;
         OpenSearchIme();
         return true;
     }, false, true);
 
-    registerAction("Refresh", brls::BUTTON_X, [this](brls::View* view) {
+    registerAction(opennow::Tr("Refresh"), brls::BUTTON_X, [this](brls::View* view) {
         (void)view;
         RefreshData();
         return true;
@@ -160,8 +162,8 @@ void SearchTab::OpenSearchIme()
             visible_limit_ = kInitialVisibleResultLimit;
             RebuildResults();
         },
-        "Search Games",
-        "Enter a title from Library or Store",
+        Tr("Search Games"),
+        Tr("Enter a title from Library or Store"),
         64,
         search_query_);
 }
@@ -172,7 +174,7 @@ void SearchTab::RefreshData()
         return;
 
     loading_ = true;
-    status_label_->setText("Refreshing Store and Library data...");
+    status_label_->setText(opennow::Tr("Refreshing Store and Library data..."));
 
     try
     {
@@ -194,17 +196,23 @@ void SearchTab::RefreshData()
             library_games_.clear();
         }
     }
+    catch (const game_feed::Deferred&)
+    {
+        loading_ = false;
+        status_label_->setText(Tr("Library refresh paused while launching the game."));
+        return;
+    }
     catch (const std::exception& ex)
     {
         loading_ = false;
-        ShowError("Search Refresh Failed", ex.what());
+        ShowError(opennow::Tr("Search Refresh Failed"), ex.what());
         RebuildResults();
         return;
     }
 
     loading_ = false;
     RebuildResults();
-    brls::Application::notify("Search data refreshed");
+    brls::Application::notify(opennow::Tr("Search data refreshed"));
 }
 
 void SearchTab::RebuildResults()
@@ -220,10 +228,10 @@ void SearchTab::RebuildResults()
     if (query.empty())
     {
         status_label_->setText(
-            "Press Y to search. Cached Library: " + std::to_string(library_games_.size()) +
-            " | Store: " + std::to_string(catalog_games_.size()));
+            opennow::Tr("Press Y to search. Cached Library: ") + std::to_string(library_games_.size()) +
+            opennow::Tr(" | Store: ") + std::to_string(catalog_games_.size()));
         results_container_->addView(MakeParagraph(
-            "Search combines your signed-in Library and NVIDIA's public Store catalog. Use X if data has not been loaded yet.",
+            opennow::Tr("Search combines your signed-in Library and NVIDIA's public Store catalog. Use X if data has not been loaded yet."),
             0.0f));
         return;
     }
@@ -259,14 +267,14 @@ void SearchTab::RebuildResults()
     const size_t visible_count = std::min(result_count_, visible_limit_);
 
     status_label_->setText(
-        "Query: " + search_query_ + " | Results: " + std::to_string(result_count_) +
-        " | Showing: " + std::to_string(visible_count) +
-        " | Library: " + std::to_string(library_games_.size()) +
-        " | Store: " + std::to_string(catalog_games_.size()));
+        opennow::Tr("Query: ") + search_query_ + opennow::Tr(" | Results: ") + std::to_string(result_count_) +
+        opennow::Tr(" | Showing: ") + std::to_string(visible_count) +
+        opennow::Tr(" | Library: ") + std::to_string(library_games_.size()) +
+        opennow::Tr(" | Store: ") + std::to_string(catalog_games_.size()));
 
     if (results.empty())
     {
-        results_container_->addView(MakeParagraph("No matching Library or Store games found.", 0.0f));
+        results_container_->addView(MakeParagraph(opennow::Tr("No matching Library or Store games found."), 0.0f));
         return;
     }
 
@@ -291,7 +299,7 @@ void SearchTab::RebuildResults()
                 const GameInfo& game = library_games_[result.index];
                 display.title = game.title;
                 display.subtitle = PrimaryStore(game);
-                display.badge = BuildMembershipBadge("In library", game.membership_tier_label);
+                display.badge = BuildMembershipBadge(Tr("In library"), Tr(game.membership_tier_label));
                 display.image_url = game.image_url;
             }
             else
@@ -299,7 +307,7 @@ void SearchTab::RebuildResults()
                 const PublicGame& game = catalog_games_[result.index];
                 display.title = game.title;
                 display.subtitle = game.store;
-                display.badge = game.publisher.empty() ? "GFN catalog" : game.publisher;
+                display.badge = game.publisher.empty() ? Tr("GFN catalog") : game.publisher;
                 display.image_url = game.image_url;
             }
 
@@ -325,7 +333,7 @@ void SearchTab::RebuildResults()
     {
         load_more_button_ = new brls::Button();
         load_more_button_->setText(
-            "Show more results (" + std::to_string(result_count_ - visible_count) + " left)");
+            opennow::Tr("Show more results (") + std::to_string(result_count_ - visible_count) + opennow::Tr(" left)"));
         load_more_button_->setStyle(&brls::BUTTONSTYLE_PRIMARY);
         load_more_button_->setMarginTop(14);
         load_more_button_->setMarginBottom(24);

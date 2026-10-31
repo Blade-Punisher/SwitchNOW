@@ -1,5 +1,7 @@
 #include "FFmpegVideoDecoder.hpp"
 #include "AVFrameHolder.hpp"
+#include "TransferFrameReuse.hpp"
+#include "DecodedFrameGate.hpp"
 #include "borealis.hpp"
 #include "../DecodeQueuePolicy.hpp"
 #include "../../stream_settings.hpp"
@@ -9,6 +11,7 @@
 #include <sstream>
 extern "C" {
 #include <libavutil/pixdesc.h>
+#include <libavutil/hwcontext.h>
 }
 #ifdef PLATFORM_APPLE
 extern "C" {
@@ -26,8 +29,6 @@ extern "C" {
 //#else
 //#define DECODER_BUFFER_SIZE 92 * 1024 * 2
 //#endif
-#define DECODER_BUFFER_SIZE (1024 * 1024)
-
 #if defined(PLATFORM_ANDROID)
 #include <jni.h>
 #include <libavcodec/jni.h>
@@ -117,6 +118,8 @@ int FFmpegVideoDecoder::setup(int video_format, int width, int height,
                               int redraw_rate, void* context, int dr_flags) {
     m_setup_diagnostics.clear();
     m_first_output_format_logged = false;
+    m_transfer_layouts.fill({0,0});
+    m_transfer_storage_reused = m_transfer_storage_fresh = 0;
     m_stream_fps = redraw_rate;
     m_requires_hardware_frames =
         (dr_flags & VIDEO_DECODER_REQUIRE_HARDWARE) != 0;
@@ -124,11 +127,15 @@ int FFmpegVideoDecoder::setup(int video_format, int width, int height,
         ((dr_flags & VIDEO_DECODER_PREFER_HARDWARE) != 0 ||
          m_requires_hardware_frames) &&
         (dr_flags & VIDEO_DECODER_FORCE_SOFTWARE) == 0;
+    m_transfer_hardware_frames = m_uses_hardware_frames &&
+        (dr_flags & VIDEO_DECODER_COPY_HARDWARE_FRAMES) != 0;
     append_setup_diagnostic(
         "request=" + std::string(m_requires_hardware_frames ? "required" :
             m_uses_hardware_frames ? "preferred" : "software") +
         " resolution=" + std::to_string(width) + "x" + std::to_string(height) +
-        " fps=" + std::to_string(redraw_rate));
+        " fps=" + std::to_string(redraw_rate) +
+        " output=" + std::string(m_transfer_hardware_frames
+            ? "software-copy" : m_uses_hardware_frames ? "native" : "software"));
 
     std::string format;
     switch (video_format) {
@@ -225,10 +232,11 @@ int FFmpegVideoDecoder::setup(int video_format, int width, int height,
         // Use low delay single threaded encoding
         m_decoder_context->flags |= AV_CODEC_FLAG_LOW_DELAY;
 
-    // Do not present corrupt or pre-keyframe pictures. RTP recovery now keeps
-    // complete access units, so these permissive flags only expose reference
-    // damage as visible macroblocks instead of holding the previous good frame.
-    m_decoder_context->flags2 |= AV_CODEC_FLAG2_FAST;
+    // Reject malformed access units instead of letting error concealment turn
+    // missing reference data into persistent green/repeated macroblocks. The
+    // session recovery path will hold the last good frame and request an IDR.
+    m_decoder_context->err_recognition =
+        AV_EF_BITSTREAM | AV_EF_BUFFER | AV_EF_EXPLODE;
 
     // NVDEC submits asynchronously and does not benefit from CPU threads.
     // Slice threading keeps software decoding parallel without holding
@@ -325,15 +333,6 @@ int FFmpegVideoDecoder::setup(int video_format, int width, int height,
         }
     }
 
-    m_ffmpeg_buffer =
-        (char*)malloc(DECODER_BUFFER_SIZE + AV_INPUT_BUFFER_PADDING_SIZE);
-    if (m_ffmpeg_buffer == nullptr) {
-        fail_setup("alloc_input_buffer", AVERROR(ENOMEM),
-                   "bytes=" + std::to_string(DECODER_BUFFER_SIZE));
-        cleanup();
-        return -1;
-    }
-
     append_setup_diagnostic("setup=ok");
     brls::Logger::info("FFmpeg: Setup done: {}", m_setup_diagnostics);
     return 0;
@@ -366,22 +365,21 @@ void FFmpegVideoDecoder::cleanup() {
         av_frame_free(&tmp_frame);
     }
 
-    if (m_ffmpeg_buffer) {
-        free(m_ffmpeg_buffer);
-        m_ffmpeg_buffer = nullptr;
-    }
-
     AVFrameHolder::instance().cleanup();
 
     brls::Logger::info("FFmpeg: Cleanup done!");
 }
 
 int FFmpegVideoDecoder::submit_decode_unit(uint8_t* indata, int inlen, int64_t pts) {
+    m_submission={};
+    m_receive_error=0;
     if (!indata || inlen <= 0)
         return 0;
 
-    if (inlen > DECODER_BUFFER_SIZE) {
+    if (static_cast<std::size_t>(inlen) >
+        opennow::video::MaximumDecodeUnitBytes()) {
         brls::Logger::error("FFmpeg: Big buffer to decode...");
+        m_submission.codec_error=-1;
         return -1;
     }
 
@@ -392,19 +390,25 @@ int FFmpegVideoDecoder::submit_decode_unit(uint8_t* indata, int inlen, int64_t p
         while ((m_frame = get_frame(true)) != nullptr) {
             if ((m_frame->flags & AV_FRAME_FLAG_CORRUPT) != 0 ||
                 m_frame->decode_error_flags != 0) {
-                m_corrupt_frames_dropped++;
-                if (m_corrupt_frames_dropped <= 5 || m_corrupt_frames_dropped % 60 == 0) {
+                const auto corrupt_count=m_corrupt_frames_dropped.fetch_add(1)+1;
+                ++m_submission.corrupt_frames;
+                if(m_frame_gate) m_frame_gate->Publish(m_frame);
+                if (corrupt_count <= 5 || corrupt_count % 60 == 0) {
                     brls::Logger::warning(
                         "FFmpeg: dropping corrupt frame flags={} decodeErrors={} total={}",
                         m_frame->flags, m_frame->decode_error_flags,
-                        m_corrupt_frames_dropped);
+                        corrupt_count);
                 }
                 av_frame_unref(m_frame);
                 continue;
             }
             m_frames_out++;
-            decoded_frames++;
-            AVFrameHolder::instance().push(m_frame);
+            if(m_frame_gate) {
+                if(m_frame_gate->Publish(m_frame)) ++decoded_frames;
+            } else {
+                ++decoded_frames;
+                AVFrameHolder::instance().push(m_frame);
+            }
         }
     };
 
@@ -414,10 +418,20 @@ int FFmpegVideoDecoder::submit_decode_unit(uint8_t* indata, int inlen, int64_t p
         decode_result = decode(reinterpret_cast<char*>(indata), inlen, pts);
     }
 
-    if (decode_result < 0)
+    if (decode_result < 0) {
+        m_submission.codec_error=decode_result;
         return decode_result;
+    }
+    m_submission.packet_accepted=true;
 
     drain_frames();
+
+    if(m_receive_error<0) {
+        m_submission.codec_error=m_receive_error;
+        return m_receive_error;
+    }
+    if (decoded_frames == 0 && m_submission.corrupt_frames)
+        return AVERROR_INVALIDDATA;
 
     return decoded_frames;
 }
@@ -470,10 +484,15 @@ AVFrame* FFmpegVideoDecoder::get_frame(bool native_frame) {
     int err;
     AVFrame* resultFrame = m_frames[m_next_frame];
     AVFrame* decodeFrame = resultFrame;
-    av_frame_unref(resultFrame);
+    const bool reusable_transfer = hw_device_ctx && m_transfer_hardware_frames;
+    if (!reusable_transfer) av_frame_unref(resultFrame);
 
-#if !defined(PLATFORM_ANDROID) && !defined(BOREALIS_USE_DEKO3D) && !defined(USE_METAL_RENDERER)
-    if (hw_device_ctx) {
+#if !defined(PLATFORM_ANDROID) && !defined(USE_METAL_RENDERER)
+    if (hw_device_ctx
+#if defined(BOREALIS_USE_DEKO3D)
+        && m_transfer_hardware_frames
+#endif
+    ) {
         // For HW->SW transfer path we decode into a temporary hardware frame.
         av_frame_unref(tmp_frame);
         decodeFrame = tmp_frame;
@@ -490,6 +509,7 @@ AVFrame* FFmpegVideoDecoder::get_frame(bool native_frame) {
         }
 
         char a[AV_ERROR_MAX_STRING_SIZE] = { 0 };
+        m_receive_error=err;
         brls::Logger::error("FFmpeg: Error receiving frame with error {}",  av_make_error_string(a, AV_ERROR_MAX_STRING_SIZE, err));
         return nullptr;
     }
@@ -502,12 +522,46 @@ AVFrame* FFmpegVideoDecoder::get_frame(bool native_frame) {
             "firstOutput=" + std::string(pixel_name ? pixel_name : "unknown") +
             "(" + std::to_string(decodeFrame->format) + ")" +
             " hwFrames=" + std::to_string(hw_device_ctx ? 1 : 0));
+        append_setup_diagnostic("colorSpace=" + std::to_string(decodeFrame->colorspace) +
+            " colorRange=" + std::to_string(decodeFrame->color_range) +
+            " chromaLocation=" + std::to_string(decodeFrame->chroma_location));
         brls::Logger::info("FFmpeg: first decoded output: {}",
                            m_setup_diagnostics);
     }
 
     if (hw_device_ctx) {
-#if defined(BOREALIS_USE_DEKO3D) || defined(PLATFORM_ANDROID) || defined(USE_METAL_RENDERER)
+#if defined(BOREALIS_USE_DEKO3D)
+        if (!m_transfer_hardware_frames) {
+            // Zero-copy is kept as an explicit NVDEC diagnostic backend.
+            resultFrame = decodeFrame;
+        } else {
+            const auto* hw_frames = decodeFrame->hw_frames_ctx
+                ? reinterpret_cast<const AVHWFramesContext*>(decodeFrame->hw_frames_ctx->data) : nullptr;
+            const auto layout = hw_frames ? std::pair{hw_frames->width, hw_frames->height} : std::pair{0,0};
+            const bool reused_storage = opennow::video::RetainTransferStorage(resultFrame,
+                hw_frames ? hw_frames->sw_format : AV_PIX_FMT_NONE,
+                decodeFrame->width, decodeFrame->height,
+                hw_frames && m_transfer_layouts[m_next_frame] == layout);
+            if (!reused_storage) av_frame_unref(resultFrame);
+            const auto transfer_started = std::chrono::steady_clock::now();
+            if ((err = av_hwframe_transfer_data(resultFrame, decodeFrame, 0)) < 0) {
+                char a[AV_ERROR_MAX_STRING_SIZE] = { 0 };
+                brls::Logger::error(
+                    "FFmpeg: Error transferring NVTEGRA frame with error {}",
+                    av_make_error_string(a, AV_ERROR_MAX_STRING_SIZE, err));
+                return nullptr;
+            }
+            const uint64_t transfer_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - transfer_started).count();
+            m_transfer_us_total.fetch_add(transfer_us, std::memory_order_relaxed);
+            m_transfer_count.fetch_add(1, std::memory_order_relaxed);
+            m_transfer_layouts[m_next_frame] = layout;
+            (reused_storage ? m_transfer_storage_reused : m_transfer_storage_fresh).fetch_add(1, std::memory_order_relaxed);
+            if (transfer_us > m_transfer_us_max.load(std::memory_order_relaxed))
+                m_transfer_us_max.store(transfer_us, std::memory_order_relaxed);
+            av_frame_copy_props(resultFrame, decodeFrame);
+        }
+#elif defined(PLATFORM_ANDROID) || defined(USE_METAL_RENDERER)
         // Keep hardware-backed frame references per queue slot.
         resultFrame = decodeFrame;
 #else

@@ -13,10 +13,61 @@
 #include <usrsctp.h>
 #endif
 
+static int sctp_diagnostics_enabled = 0;
+static void (*sctp_diagnostics_sink)(const char*, int) = NULL;
+static FILE* sctp_diag_file = NULL;
+static FILE* sctp_diag_trace = NULL;
+static FILE* sctp_diag_input = NULL;
+
+static void sctp_close_diagnostics(void) {
+  if (sctp_diag_file) fclose(sctp_diag_file);
+  if (sctp_diag_trace) fclose(sctp_diag_trace);
+  if (sctp_diag_input) fclose(sctp_diag_input);
+  sctp_diag_file = NULL;
+  sctp_diag_trace = NULL;
+  sctp_diag_input = NULL;
+}
+
+void sctp_flush_diagnostics(void) {
+  if (sctp_diag_file) fflush(sctp_diag_file);
+  if (sctp_diag_trace) fflush(sctp_diag_trace);
+  if (sctp_diag_input) fflush(sctp_diag_input);
+}
+
+void sctp_set_diagnostics_enabled(int enabled) {
+  sctp_diagnostics_enabled = enabled != 0;
+  if (!sctp_diagnostics_enabled)
+    sctp_close_diagnostics();
+}
+
+void sctp_set_diagnostics_sink(void (*sink)(const char*, int)) {
+  sctp_diagnostics_sink = sink;
+  if (sink) sctp_close_diagnostics();
+}
+
 static void sctp_diag_log(const char* fmt, ...) {
-  FILE* file = fopen("sdmc:/switch/OpenNOWSwitch/signaling.log", "a");
-  FILE* trace = fopen("sdmc:/switch/OpenNOWSwitch/stream_trace.log", "a");
-  FILE* input = fopen("sdmc:/switch/OpenNOWSwitch/input.log", "a");
+  if (!sctp_diagnostics_enabled)
+    return;
+  if (sctp_diagnostics_sink) {
+    char line[1024];
+    char message[960];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(message, sizeof(message), fmt, args);
+    va_end(args);
+    snprintf(line, sizeof(line), "SCTP %s", message);
+    sctp_diagnostics_sink(line, 1);
+    return;
+  }
+  if (!sctp_diag_file)
+    sctp_diag_file = fopen("sdmc:/switch/SwitchNOW/signaling.log", "a");
+  if (!sctp_diag_trace)
+    sctp_diag_trace = fopen("sdmc:/switch/SwitchNOW/stream_trace.log", "a");
+  if (!sctp_diag_input)
+    sctp_diag_input = fopen("sdmc:/switch/SwitchNOW/input.log", "a");
+  FILE* file = sctp_diag_file;
+  FILE* trace = sctp_diag_trace;
+  FILE* input = sctp_diag_input;
   va_list args;
   va_start(args, fmt);
   if (file) {
@@ -26,7 +77,6 @@ static void sctp_diag_log(const char* fmt, ...) {
     vfprintf(file, fmt, copy);
     va_end(copy);
     fputc('\n', file);
-    fclose(file);
   }
   if (input) {
     fputs("SCTP ", input);
@@ -35,13 +85,11 @@ static void sctp_diag_log(const char* fmt, ...) {
     vfprintf(input, fmt, copy);
     va_end(copy);
     fputc('\n', input);
-    fclose(input);
   }
   if (trace) {
     fputs("SCTP ", trace);
     vfprintf(trace, fmt, args);
     fputc('\n', trace);
-    fclose(trace);
   }
   va_end(args);
 }
@@ -162,10 +210,49 @@ static int sctp_outgoing_data_cb(void* userdata, void* buf, size_t len, uint8_t 
     }
   }
 
+  const uint32_t send_begin = ports_get_epoch_time();
   const int written = dtls_srtp_write(sctp->dtls_srtp, buf, len);
+  const uint32_t send_elapsed = ports_get_epoch_time() - send_begin;
+  if (send_elapsed >= 8) sctp_diag_log("DTLS encrypt_and_send_ms=%u bytes=%zu", send_elapsed, len);
   if (written < 0)
     sctp_diag_log("dtls_write_failed ret=%d bytes=%zu", written, len);
   return written < 0 ? written : 0;
+}
+
+void sctp_retransmit_pending(Sctp* sctp) {
+#if !CONFIG_USE_USRSCTP
+  if (!sctp) return;
+  if (!sctp->connected) {
+    const uint32_t now = ports_get_epoch_time();
+    if (sctp_handshake_due(&sctp->handshake_retry, now, 0)) {
+      const int result = dtls_srtp_write(sctp->dtls_srtp,
+          sctp->handshake_retry.bytes, sctp->handshake_retry.size);
+      sctp->handshake_retry.sent_ms = now;
+      ++sctp->handshake_retry.retries;
+      sctp_diag_log("handshake_retry chunk=%u attempt=%u result=%d",
+          sctp->handshake_retry.bytes[12], sctp->handshake_retry.retries, result);
+    }
+    return;
+  }
+  sctp->handshake_retry.size = 0;
+  SctpReliableRecord* record = sctp_reliable_oldest(&sctp->reliable_outbound);
+  if (!record) return;
+  const uint32_t now_ms = ports_get_epoch_time();
+  uint32_t rto_ms = sctp->smoothed_rtt_ms ? sctp->smoothed_rtt_ms * 3 : 250;
+  if (rto_ms < 200) rto_ms = 200;
+  if (rto_ms > 1000 || record->retries >= 6) rto_ms = 1000;
+  if (!sctp_reliable_retry_due(record, now_ms, rto_ms)) return;
+  // Keep the same TSN and CRC. Resending only the oldest missing packet lets
+  // the peer advance its cumulative ACK without flooding the input channel.
+  const int result = sctp_outgoing_data_cb(sctp, record->bytes, record->length, 0, 0);
+  record->last_attempt_ms = now_ms;
+  if (record->retries < UINT8_MAX) ++record->retries;
+  if (record->retries <= 3 || record->retries % 8 == 0 || result < 0)
+    sctp_diag_log("retransmit tsn=%u attempt=%u outstanding=%u result=%d",
+                  record->tsn, record->retries, sctp->reliable_outbound.count, result);
+#else
+  (void)sctp;
+#endif
 }
 
 int sctp_outgoing_data(Sctp* sctp, char* buf, size_t len, SctpDataPpid ppid, uint16_t sid) {
@@ -189,7 +276,7 @@ int sctp_outgoing_data(Sctp* sctp, char* buf, size_t len, SctpDataPpid ppid, uin
   size_t padding_len = 0;
   size_t payload_max = SCTP_MTU - sizeof(SctpPacket) - sizeof(SctpDataChunk);
   size_t pos = 0;
-  static uint16_t sqn = 0;
+  if (sid >= SCTP_MAX_STREAMS || (sctp->outbound_streams && sid >= sctp->outbound_streams)) return -1;
 
   SctpPacket* packet = (SctpPacket*)(sctp->buf);
   SctpDataChunk* chunk = (SctpDataChunk*)(packet->chunks);
@@ -201,12 +288,16 @@ int sctp_outgoing_data(Sctp* sctp, char* buf, size_t len, SctpDataPpid ppid, uin
   chunk->type = SCTP_DATA;
   chunk->iube = 0x06;
   chunk->sid = htons(sid);
-  chunk->sqn = htons(sqn++);
+  chunk->sqn = htons(sctp->outbound_sequence[sid]);
   chunk->ppid = htonl(ppid);
 
   while (len > payload_max) {
+    if (sctp->reliable_outbound.count >= SCTP_RELIABLE_CAPACITY) {
+      sctp_diag_log("send_window_full outstanding=%u", sctp->reliable_outbound.count);
+      return SCTP_SEND_WINDOW_FULL;
+    }
     chunk->length = htons(payload_max + sizeof(SctpDataChunk));
-    chunk->tsn = htonl(sctp->tsn++);
+    chunk->tsn = htonl(sctp->tsn);
     memcpy(chunk->data, buf + pos, payload_max);
     packet->header.checksum = 0;
 
@@ -214,6 +305,10 @@ int sctp_outgoing_data(Sctp* sctp, char* buf, size_t len, SctpDataPpid ppid, uin
 
     if (sctp_outgoing_data_cb(sctp, sctp->buf, SCTP_MTU, 0, 0) < 0)
       return -1;
+    (void)sctp_reliable_push(&sctp->reliable_outbound,
+                             (const uint8_t*)sctp->buf, SCTP_MTU,
+                             sctp->tsn, ports_get_epoch_time());
+    ++sctp->tsn;
     sctp->last_outbound_tsn = ntohl(chunk->tsn);
     sctp->last_outbound_sent_ms = ports_get_epoch_time();
     chunk->iube = 0x04;
@@ -222,9 +317,13 @@ int sctp_outgoing_data(Sctp* sctp, char* buf, size_t len, SctpDataPpid ppid, uin
   }
 
   if (len > 0) {
+    if (sctp->reliable_outbound.count >= SCTP_RELIABLE_CAPACITY) {
+      sctp_diag_log("send_window_full outstanding=%u", sctp->reliable_outbound.count);
+      return SCTP_SEND_WINDOW_FULL;
+    }
     chunk->length = htons(len + sizeof(SctpDataChunk));
     chunk->iube++;
-    chunk->tsn = htonl(sctp->tsn++);
+    chunk->tsn = htonl(sctp->tsn);
     memset(chunk->data, 0, payload_max);
     memcpy(chunk->data, buf + pos, len);
     packet->header.checksum = 0;
@@ -235,9 +334,14 @@ int sctp_outgoing_data(Sctp* sctp, char* buf, size_t len, SctpDataPpid ppid, uin
 
     if (sctp_outgoing_data_cb(sctp, sctp->buf, padding_len, 0, 0) < 0)
       return -1;
+    (void)sctp_reliable_push(&sctp->reliable_outbound,
+                             (const uint8_t*)sctp->buf, padding_len,
+                             sctp->tsn, ports_get_epoch_time());
+    ++sctp->tsn;
     sctp->last_outbound_tsn = ntohl(chunk->tsn);
     sctp->last_outbound_sent_ms = ports_get_epoch_time();
   }
+  ++sctp->outbound_sequence[sid];
   return (int)original_len;
 #endif
 }
@@ -277,7 +381,7 @@ void sctp_parse_data_channel_open(Sctp* sctp, uint16_t sid, char* data, size_t l
     sctp_add_stream_mapping(sctp, label_str, sid);
     sctp_diag_log("dcep_open sid=%u label=%s", sid, label_str);
     char ack = DATA_CHANNEL_ACK;
-    sctp_outgoing_data(sctp, &ack, 1, DATA_CHANNEL_PPID_CONTROL, sid);
+    sctp_outgoing_data(sctp, &ack, 1, PPID_CONTROL, sid);
   }
 }
 
@@ -311,7 +415,10 @@ void sctp_incoming_data(Sctp* sctp, char* buf, size_t len) {
   }
   usrsctp_conninput(sctp, buf, len, 0);
 #else
+  if (!buf || len < sizeof(SctpHeader) + sizeof(SctpChunkCommon) || len > CONFIG_MTU)
+    return;
   size_t length = 0;
+  int outgoing_dcep_ack = 0;
   size_t pos = sizeof(SctpHeader);
   SctpChunkCommon* chunk_common;
   SctpPacket* in_packet = (SctpPacket*)buf;
@@ -343,13 +450,30 @@ void sctp_incoming_data(Sctp* sctp, char* buf, size_t len) {
     return;
   }
 
+  const uint32_t tag = ntohl(in_packet->header.verification_tag);
+  if ((first_chunk_type == SCTP_INIT && tag != 0) ||
+      (first_chunk_type != SCTP_INIT && tag != sctp->local_verification_tag)) {
+    sctp_diag_log("handshake_drop reason=verification_tag chunk=%u", first_chunk_type);
+    return;
+  }
+
   // prepare outgoing packet
   memset(sctp->buf, 0, sizeof(sctp->buf));
-  while ((4 * (pos + 3) / 4) < len) {
+  while (pos + sizeof(SctpChunkCommon) <= len) {
     chunk_common = (SctpChunkCommon*)(buf + pos);
+    const size_t chunk_length = ntohs(chunk_common->length);
+    if (chunk_length < sizeof(SctpChunkCommon) || chunk_length > len - pos) {
+      sctp_diag_log("handshake_drop reason=chunk_length chunk=%u", chunk_common->type);
+      return;
+    }
+    if (((chunk_common->type == SCTP_INIT || chunk_common->type == SCTP_INIT_ACK) && chunk_length < 20) ||
+        (chunk_common->type == SCTP_DATA && chunk_length < sizeof(SctpDataChunk) + 1) ||
+        (chunk_common->type == SCTP_SACK && chunk_length < 16)) return;
+    length = 0;
 
     switch (chunk_common->type) {
       case SCTP_DATA: {
+        if (!sctp->connected) break;
         SctpDataChunk* data_chunk = (SctpDataChunk*)(buf + pos);
         SctpSackChunk* sack_chunk = (SctpSackChunk*)out_packet->chunks;
 
@@ -364,16 +488,22 @@ void sctp_incoming_data(Sctp* sctp, char* buf, size_t len) {
 
         LOGD("SCTP_DATA. ppid = %ld, data = %.2x", ntohl(data_chunk->ppid), data_chunk->data[0]);
         if (ntohl(data_chunk->ppid) == DATA_CHANNEL_PPID_CONTROL && data_chunk->data[0] == DATA_CHANNEL_OPEN) {
+          if (sctp->reliable_outbound.count >= SCTP_RELIABLE_CAPACITY) {
+            sctp_diag_log("dcep_ack_window_full outstanding=%u", sctp->reliable_outbound.count);
+            pos = len;
+            break;
+          }
           data_chunk = (SctpDataChunk*)sack_chunk->blocks;
           data_chunk->type = SCTP_DATA;
           data_chunk->iube = 0x03;
-          data_chunk->tsn = htonl(sctp->tsn++);
+          data_chunk->tsn = htonl(sctp->tsn);
           data_chunk->sid = htons(0);
           data_chunk->sqn = htons(0);
           data_chunk->ppid = htonl(DATA_CHANNEL_PPID_CONTROL);
           data_chunk->length = htons(1 + sizeof(SctpDataChunk));
           data_chunk->data[0] = DATA_CHANNEL_ACK;
           length += ntohs(data_chunk->length);
+          outgoing_dcep_ack = 1;
         } else if (ntohl(data_chunk->ppid) == DATA_CHANNEL_PPID_DOMSTRING || ntohl(data_chunk->ppid) == DATA_CHANNEL_PPID_BINARY) {
           if (sctp->onmessage) {
             sctp->onmessage((char*)data_chunk->data, ntohs(data_chunk->length) - sizeof(SctpDataChunk),
@@ -386,34 +516,46 @@ void sctp_incoming_data(Sctp* sctp, char* buf, size_t len) {
         LOGD("SCTP_INIT");
 
         SctpInitChunk* init_chunk;
-        init_chunk = (SctpInitChunk*)in_packet->chunks;
+        init_chunk = (SctpInitChunk*)chunk_common;
+        const uint16_t peer_out = ntohs(init_chunk->number_of_outbound_streams);
+        const uint16_t peer_in = ntohs(init_chunk->number_of_inbound_streams);
+        if (!init_chunk->initiate_tag || !peer_out || !peer_in || ntohl(init_chunk->a_rwnd) < 1500)
+          return;
+        if (sctp->connected && sctp->verification_tag != init_chunk->initiate_tag) return;
         sctp->verification_tag = init_chunk->initiate_tag;
+        sctp->outbound_streams = peer_in < SCTP_MAX_STREAMS ? peer_in : SCTP_MAX_STREAMS;
 
         SctpInitChunk* init_ack = (SctpInitChunk*)out_packet->chunks;
         init_ack->common.type = SCTP_INIT_ACK;
         init_ack->common.flags = 0x00;
-        init_ack->common.length = htons(20 + 8);
-        init_ack->initiate_tag = htonl(0x12345678);
+        init_ack->common.length = htons(20 + 4 + sizeof(sctp->local_cookie));
+        init_ack->initiate_tag = htonl(sctp->local_verification_tag);
         init_ack->a_rwnd = htonl(0x100000);
-        init_ack->number_of_outbound_streams = 0xffff;
-        init_ack->number_of_inbound_streams = 0xffff;
-        init_ack->initial_tsn = htonl(sctp->tsn);
+        // RFC9260 3.3.3: OS in INIT_ACK cannot exceed the peer's INIT MIS.
+        init_ack->number_of_outbound_streams = htons(sctp->outbound_streams);
+        init_ack->number_of_inbound_streams = htons(sctp->inbound_streams);
+        init_ack->initial_tsn = htonl(sctp->initial_tsn);
 
         SctpChunkParam* param = init_ack->param;
 
         param->type = htons(SCTP_PARAM_STATE_COOKIE);
-        param->length = htons(8);
-        const uint32_t cookie_value = htonl(0x02);
-        memcpy(param->value, &cookie_value, sizeof(cookie_value));
+        param->length = htons(4 + sizeof(sctp->local_cookie));
+        memcpy(param->value, sctp->local_cookie, sizeof(sctp->local_cookie));
+        sctp->cookie_issued = 1;
         length = ntohs(init_ack->common.length) + sizeof(SctpHeader);
-        sctp_diag_log("internal_init_ack prepared peerTag=%08x localTag=12345678 bytes=%zu",
-                      ntohl(sctp->verification_tag), length);
+        sctp_diag_log("internal_init_ack prepared peerTag=%08x localTag=%08x peerOS=%u peerMIS=%u negotiatedOS=%u localMIS=%u bytes=%zu",
+                      ntohl(sctp->verification_tag), sctp->local_verification_tag,
+                      peer_out, peer_in, sctp->outbound_streams, sctp->inbound_streams, length);
       } break;
       case SCTP_INIT_ACK: {
-        SctpInitChunk* init_ack = (SctpInitChunk*)in_packet->chunks;
+        if (sctp->connected) break;
+        SctpInitChunk* init_ack = (SctpInitChunk*)chunk_common;
         SctpCookieEchoChunk* cookie_echo = (SctpCookieEchoChunk*)out_packet->chunks;
         SctpChunkParam* param = NULL;
-        sctp->verification_tag = init_ack->initiate_tag;
+        const uint16_t peer_out = ntohs(init_ack->number_of_outbound_streams);
+        const uint16_t peer_in = ntohs(init_ack->number_of_inbound_streams);
+        if (!init_ack->initiate_tag || !peer_out || !peer_in ||
+            peer_out > sctp->inbound_streams || ntohl(init_ack->a_rwnd) < 1500) return;
         const int init_ack_length = ntohs(init_ack->common.length);
         uint8_t* params = (uint8_t*)&init_ack->param[0];
         int offset = 0;
@@ -429,10 +571,14 @@ void sctp_incoming_data(Sctp* sctp, char* buf, size_t len) {
           }
           offset += (candidate_length + 3) & ~3;
         }
-        if (!param) {
+        if (!param || ntohs(param->length) <= 4 ||
+            (size_t)ntohs(param->length) + sizeof(SctpHeader) > sizeof(sctp->buf)) {
           LOGE("SCTP_INIT_ACK without cookie");
           break;
         }
+        sctp->verification_tag = init_ack->initiate_tag;
+        sctp->outbound_streams = peer_in < SCTP_MAX_STREAMS ? peer_in : SCTP_MAX_STREAMS;
+        sctp->cookie_echo_pending = 1;
 
         cookie_echo->common.type = SCTP_COOKIE_ECHO;
         cookie_echo->common.flags = 0x00;
@@ -446,18 +592,25 @@ void sctp_incoming_data(Sctp* sctp, char* buf, size_t len) {
       } break;
       case SCTP_SACK: {
         SctpSackChunk* sack = (SctpSackChunk*)(buf + pos);
-        if (sctp->last_outbound_sent_ms != 0 &&
-            (int32_t)(ntohl(sack->cumulative_tsn_ack) -
-                      sctp->last_outbound_tsn) >= 0) {
-          const uint32_t sample_ms =
-              ports_get_epoch_time() - sctp->last_outbound_sent_ms;
-          if (sample_ms > 0 && sample_ms <= 5000) {
-            sctp->smoothed_rtt_ms = sctp->smoothed_rtt_ms == 0
-                ? sample_ms
-                : (sctp->smoothed_rtt_ms * 7 + sample_ms) / 8;
+        if (ntohs(sack->common.length) >= 16) {
+          SctpReliableRecord* oldest = sctp_reliable_oldest(&sctp->reliable_outbound);
+          const uint32_t cumulative_tsn = ntohl(sack->cumulative_tsn_ack);
+          if (oldest && oldest->retries == 0 &&
+              (int32_t)(cumulative_tsn - oldest->tsn) >= 0) {
+            const uint32_t sample_ms = ports_get_epoch_time() - oldest->last_attempt_ms;
+            if (sample_ms > 0 && sample_ms <= 5000)
+              sctp->smoothed_rtt_ms = sctp->smoothed_rtt_ms == 0
+                  ? sample_ms : (sctp->smoothed_rtt_ms * 7 + sample_ms) / 8;
           }
-          sctp->last_outbound_sent_ms = 0;
+          const unsigned acknowledged =
+              sctp_reliable_ack(&sctp->reliable_outbound, cumulative_tsn);
+          if (acknowledged >= 8)
+            sctp_diag_log("ack_progress cumulativeTsn=%u released=%u outstanding=%u",
+                          cumulative_tsn, acknowledged, sctp->reliable_outbound.count);
         }
+        // Only the never-retransmitted reliable record is a valid RTT sample.
+        // The legacy last_outbound sample measured the same SACK twice and
+        // could include a retransmission (Karn's ambiguity).
 #if 0
         LOGD("SCTP_SACK");
         LOGD("cumulative_tsn_ack %d", ntohl(sack->cumulative_tsn_ack));
@@ -489,12 +642,17 @@ void sctp_incoming_data(Sctp* sctp, char* buf, size_t len) {
 #endif
       } break;
       case SCTP_COOKIE_ECHO: {
+        if (!sctp->cookie_issued || chunk_length != 4 + sizeof(sctp->local_cookie) ||
+            memcmp(buf + pos + 4, sctp->local_cookie, sizeof(sctp->local_cookie)) != 0) {
+          sctp_diag_log("handshake_drop reason=cookie_mismatch");
+          return;
+        }
         LOGD("SCTP_COOKIE_ECHO");
         SctpChunkCommon* common = (SctpChunkCommon*)out_packet->chunks;
         common->type = SCTP_COOKIE_ACK;
         common->length = htons(4);
         length = ntohs(common->length) + sizeof(SctpHeader);
-        pos = len;  // Do not handle other msg
+        sctp->handshake_retry.size = 0;
         if (!sctp->connected) {
           sctp->connected = 1;
           sctp_diag_log("internal_assoc connected_by=cookie_echo");
@@ -504,6 +662,8 @@ void sctp_incoming_data(Sctp* sctp, char* buf, size_t len) {
         }
       } break;
       case SCTP_COOKIE_ACK: {
+        if (!sctp->cookie_echo_pending || chunk_length != 4) break;
+        sctp->handshake_retry.size = 0;
         if (!sctp->connected) {
           sctp->connected = 1;
           sctp_diag_log("internal_assoc connected_by=cookie_ack");
@@ -514,6 +674,7 @@ void sctp_incoming_data(Sctp* sctp, char* buf, size_t len) {
         break;
       }
       case SCTP_ABORT:
+        sctp->handshake_retry.size = 0;
         sctp->connected = 0;
         if (sctp->onclose) {
           sctp->onclose(sctp->userdata);
@@ -536,6 +697,14 @@ void sctp_incoming_data(Sctp* sctp, char* buf, size_t len) {
       const uint32_t calculated_checksum = sctp_get_checksum(sctp, sctp->buf, length);
       out_packet->header.checksum = htonl(calculated_checksum);
       const int written = dtls_srtp_write(sctp->dtls_srtp, sctp->buf, length);
+      if (!sctp->connected && out_packet->chunks[0] == SCTP_COOKIE_ECHO)
+        sctp_handshake_save(&sctp->handshake_retry, sctp->buf, length,
+                            ports_get_epoch_time());
+      if (outgoing_dcep_ack && written >= 0) {
+        (void)sctp_reliable_push(&sctp->reliable_outbound, sctp->buf, length,
+                                 sctp->tsn, ports_get_epoch_time());
+        ++sctp->tsn;
+      }
       static uint32_t internal_tx_diag_count = 0;
       internal_tx_diag_count++;
       if (written < 0 || internal_tx_diag_count <= 10 || internal_tx_diag_count % 600 == 0) {
@@ -545,7 +714,7 @@ void sctp_incoming_data(Sctp* sctp, char* buf, size_t len) {
       }
       // sctp_outgoing_data_cb(sctp, sctp->buf, SCTP_MTU, 0, 0);
     }
-    pos += ntohs(chunk_common->length);
+    pos += (chunk_length + 3u) & ~3u;
   }
 #endif
 }
@@ -666,7 +835,14 @@ int sctp_create_association(Sctp* sctp, DtlsSrtp* dtls_srtp) {
   sctp->dtls_srtp = dtls_srtp;
   sctp->local_port = 5000;
   sctp->remote_port = 5000;
+  sctp->verification_tag = 0;
   sctp->tsn = 1234;
+  sctp->initial_tsn = sctp->tsn;
+  sctp->outbound_streams = sctp->inbound_streams = SCTP_MAX_STREAMS;
+  sctp->cookie_issued = sctp->cookie_echo_pending = sctp->connected = 0;
+  memset(&sctp->reliable_outbound, 0, sizeof(sctp->reliable_outbound));
+  memset(&sctp->handshake_retry, 0, sizeof(sctp->handshake_retry));
+  memset(sctp->outbound_sequence, 0, sizeof(sctp->outbound_sequence));
 #if CONFIG_USE_USRSCTP
   int ret = -1;
   usrsctp_sysctl_set_sctp_ecn_enable(0);
@@ -769,6 +945,11 @@ int sctp_create_association(Sctp* sctp, DtlsSrtp* dtls_srtp) {
   }
 
 #else
+  uint32_t random_tag = 0;
+  if (mbedtls_ctr_drbg_random(&dtls_srtp->ctr_drbg, (unsigned char*)&random_tag, sizeof(random_tag)) != 0 ||
+      mbedtls_ctr_drbg_random(&dtls_srtp->ctr_drbg, sctp->local_cookie, sizeof(sctp->local_cookie)) != 0)
+    return -1;
+  sctp->local_verification_tag = random_tag ? random_tag : 1u;
   // send SCTP_INIT
   int length = 0;
   SctpInitChunk* init_chunk;
@@ -783,10 +964,10 @@ int sctp_create_association(Sctp* sctp, DtlsSrtp* dtls_srtp) {
   init_chunk->common.type = SCTP_INIT;
   init_chunk->common.flags = 0x00;
   init_chunk->common.length = htons(20);
-  init_chunk->initiate_tag = htonl(0x12345678);
+  init_chunk->initiate_tag = htonl(sctp->local_verification_tag);
   init_chunk->a_rwnd = htonl(0x100000);
-  init_chunk->number_of_outbound_streams = 0xffff;
-  init_chunk->number_of_inbound_streams = 0xffff;
+  init_chunk->number_of_outbound_streams = htons(sctp->outbound_streams);
+  init_chunk->number_of_inbound_streams = htons(sctp->inbound_streams);
   init_chunk->initial_tsn = htonl(sctp->tsn);
   length = ntohs(init_chunk->common.length) + sizeof(SctpHeader);
   length = (4 * ((length + 3) / 4));
@@ -796,6 +977,8 @@ int sctp_create_association(Sctp* sctp, DtlsSrtp* dtls_srtp) {
   const uint32_t calculated_checksum = sctp_get_checksum(sctp, sctp->buf, length);
   header->checksum = htonl(calculated_checksum);
   const int written = dtls_srtp_write(sctp->dtls_srtp, sctp->buf, length);
+  sctp_handshake_save(&sctp->handshake_retry, sctp->buf, length,
+                      ports_get_epoch_time());
   sctp_diag_log("internal_init tx bytes=%d dtlsWrite=%d crc=%08x",
                 length, written, calculated_checksum);
 #endif
@@ -804,6 +987,7 @@ int sctp_create_association(Sctp* sctp, DtlsSrtp* dtls_srtp) {
 }
 
 void sctp_destroy_association(Sctp* sctp) {
+  if (sctp) sctp->handshake_retry.size = 0;
 #if CONFIG_USE_USRSCTP
   if (sctp && sctp->sock) {
     usrsctp_shutdown(sctp->sock, SHUT_RDWR);

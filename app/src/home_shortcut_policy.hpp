@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -19,6 +20,8 @@ struct LaunchRequest
     std::string store;
     std::string image_url;
     std::string executable_path;
+    // Runtime provenance only; never trusted from manifest contents.
+    std::string manifest_path;
 };
 
 inline bool IsNumericLaunchId(std::string_view value)

@@ -1,4 +1,5 @@
 #include "webrtc_session.hpp"
+#include "controller_report_queue.hpp"
 #include "stream_diagnostics.hpp"
 #include "internal.hpp"
 
@@ -118,7 +119,8 @@ int16_t AxisToI16(float value)
     return static_cast<int16_t>(value * 32767.0f);
 }
 
-std::vector<uint8_t> BuildGamepadPayload(uint64_t timestamp_us, uint16_t buttons,
+std::vector<uint8_t> BuildGamepadPayload(uint64_t timestamp_us, uint8_t controller_id,
+                                         uint16_t controller_bitmap, uint16_t buttons,
                                          uint8_t left_trigger, uint8_t right_trigger,
                                          int16_t lx, int16_t ly, int16_t rx, int16_t ry)
 {
@@ -126,8 +128,8 @@ std::vector<uint8_t> BuildGamepadPayload(uint64_t timestamp_us, uint16_t buttons
     payload.reserve(38);
     PutU32Le(payload, 12);
     PutU16Le(payload, 26);
-    PutU16Le(payload, 0);
-    PutU16Le(payload, 0x0101);
+    PutU16Le(payload, controller_id);
+    PutU16Le(payload, controller_bitmap);
     PutU16Le(payload, 20);
     PutU16Le(payload, buttons);
     PutU16Le(payload, static_cast<uint16_t>(left_trigger | (right_trigger << 8)));
@@ -189,8 +191,9 @@ namespace opennow::webrtc::internal
 bool InputEncodingSelfTest()
 {
     constexpr uint64_t timestamp = 0x0102030405060708ULL;
-    const auto raw = BuildGamepadPayload(timestamp, 0x1234, 0x56, 0x78, 1, -2, 3, -4);
-    if (raw.size() != 38 || raw[0] != 12 || raw[8] != 0x01 || raw[9] != 0x01 ||
+    const auto raw = BuildGamepadPayload(timestamp, 2, 0x0f0f, 0x1234, 0x56, 0x78, 1, -2, 3, -4);
+    if (raw.size() != 38 || raw[0] != 12 || raw[6] != 2 ||
+        raw[8] != 0x0f || raw[9] != 0x0f ||
         raw[24] != 0 || raw[25] != 0 || raw[26] != 0x55 || raw[27] != 0 ||
         raw[28] != 0 || raw[29] != 0 || raw[30] != 0x08 || raw[37] != 0x01) {
         return false;
@@ -202,9 +205,9 @@ bool InputEncodingSelfTest()
         return false;
     }
 
-    const auto partial = WrapPartiallyReliableGamepad(3, timestamp, 0, 1, raw);
+    const auto partial = WrapPartiallyReliableGamepad(3, timestamp, 2, 1, raw);
     if (partial.size() != 54 || partial[0] != 0x23 || partial[9] != 0x26 ||
-        partial[10] != 0 || partial[11] != 0 || partial[12] != 1 ||
+        partial[10] != 2 || partial[11] != 0 || partial[12] != 1 ||
         partial[13] != 0x21 || partial[14] != 0 || partial[15] != 38 || partial[16] != 12) {
         return false;
     }
@@ -227,6 +230,8 @@ bool InputEncodingSelfTest()
 } // namespace opennow::webrtc::internal
 
 bool WebRtcSession::send_gamepad_input(
+    uint8_t controller_id,
+    uint16_t controller_bitmap,
     uint16_t buttons,
     uint8_t left_trigger,
     uint8_t right_trigger,
@@ -234,20 +239,28 @@ bool WebRtcSession::send_gamepad_input(
     float ly,
     float rx,
     float ry) {
-    interactive_input_pending_.store(true, std::memory_order_release);
-    std::lock_guard<std::recursive_mutex> lock(peer_mutex_);
-    interactive_input_pending_.store(false, std::memory_order_release);
+    if (controller_id >= gamepad_sequences_.size())
+        return false;
+
+    const uint64_t attempt_us = NowUs();
+    if (last_input_attempt_us_ && attempt_us >= last_input_attempt_us_)
+        AtomicMax(input_interval_us_max_, attempt_us - last_input_attempt_us_);
+    last_input_attempt_us_ = attempt_us;
     gamepad_input_attempt_count_++;
-    const PeerConnectionState peer_state = pc_ ? peer_connection_get_state(pc_) : PEER_CONNECTION_CLOSED;
-    if (!pc_ || peer_state != PEER_CONNECTION_COMPLETED || !input_ready_) {
+
+    // Controller sampling runs on the UI/render thread. Sending through SCTP
+    // used to wait for the peer mutex here, so an incoming UDP burst could
+    // freeze rendering and input together for 20-30 ms. Keep only the newest
+    // report for each controller and let the transport thread send it while it
+    // already owns the peer connection. A changed state is retried by the
+    // controller delivery policy if the input channel is not ready yet.
+    if (stop_requested_.load(std::memory_order_acquire) ||
+        !input_delivery_ready_.load(std::memory_order_acquire)) {
         gamepad_input_blocked_count_++;
         if (gamepad_input_blocked_count_ <= 8 || gamepad_input_blocked_count_ % 50 == 0) {
             AppendInputLog("PAD blocked attempt=" + std::to_string(gamepad_input_attempt_count_) +
-                           " pc=" + std::to_string(pc_ ? 1 : 0) +
-                           " peer=" + (pc_ ? std::string(peer_connection_state_to_string(peer_state)) : "none") +
-                           " sctpOpen=" + std::to_string(datachannel_opened_ ? 1 : 0) +
-                           " channelRequested=" + std::to_string(datachannel_open_requested_ ? 1 : 0) +
-                           " inputReady=" + std::to_string(input_ready_ ? 1 : 0) +
+                           " deliveryReady=" +
+                               std::to_string(input_delivery_ready_.load() ? 1 : 0) +
                            " buttons=0x" + HexPreview(reinterpret_cast<const uint8_t*>(&buttons), sizeof(buttons), 2));
         }
         return false;
@@ -255,43 +268,144 @@ bool WebRtcSession::send_gamepad_input(
 
     const uint64_t timestamp_us = NowUs();
     const std::vector<uint8_t> payload = BuildGamepadPayload(
-        timestamp_us, buttons, left_trigger, right_trigger,
+        timestamp_us, controller_id, controller_bitmap, buttons, left_trigger, right_trigger,
         AxisToI16(lx), AxisToI16(-ly), AxisToI16(rx), AxisToI16(-ry));
 
-    const bool use_partial = partial_input_channel_requested_ && input_protocol_version_ >= 3;
+    const int protocol_version = input_protocol_version_.load(std::memory_order_acquire);
+    // The bundled SCTP backend uses the negotiated reliable channel. Keeping
+    // this decision local also avoids reading mutable peer state on the UI
+    // thread while it builds the coalesced report.
+    const bool use_partial = false;
     std::vector<uint8_t> wire_payload = use_partial
-        ? WrapPartiallyReliableGamepad(input_protocol_version_, timestamp_us, 0, gamepad_sequence_++, payload)
-        : WrapReliableGamepad(input_protocol_version_, timestamp_us, payload);
+        ? WrapPartiallyReliableGamepad(protocol_version, timestamp_us, controller_id,
+                                       gamepad_sequences_[controller_id]++, payload)
+        : WrapReliableGamepad(protocol_version, timestamp_us, payload);
     const uint16_t sid = use_partial ? 2 : 0;
-    const int sent = send_datachannel_binary(sid, "gamepad", wire_payload.data(), wire_payload.size());
-    if (sent < 0)
-        gamepad_send_failure_count_++;
-    else
-        gamepad_tx_count_++;
-    if (gamepad_input_attempt_count_ <= 12 || gamepad_tx_count_ <= 8 ||
-        gamepad_input_attempt_count_ % 100 == 0 || sent < 0) {
-        AppendInputLog("PAD tx attempt=" + std::to_string(gamepad_input_attempt_count_) +
-                       " report=" + std::to_string(gamepad_tx_count_) +
-                       " sid=" + std::to_string(sid) +
-                       " protocol=" + std::to_string(input_protocol_version_) +
-                       " buttons=" + std::to_string(buttons) +
-                       " lt=" + std::to_string(left_trigger) +
-                       " rt=" + std::to_string(right_trigger) +
-                       " axes=" + std::to_string(AxisToI16(lx)) + "/" +
-                       std::to_string(AxisToI16(-ly)) + "/" +
-                       std::to_string(AxisToI16(rx)) + "/" +
-                       std::to_string(AxisToI16(-ry)) +
-                       " wireBytes=" + std::to_string(wire_payload.size()) +
-                       " sent=" + std::to_string(sent) +
-                       " hex=" + HexPreview(wire_payload.data(), wire_payload.size(), 32));
+
+    {
+        std::lock_guard<std::mutex> queue_lock(outbound_input_mutex_);
+        auto& queued = pending_gamepad_reports_[controller_id];
+        PendingGamepadReport report;
+        report.wire_payload = std::move(wire_payload);
+        report.sid = sid;
+        report.controller_id = controller_id;
+        report.queued_at_us = attempt_us;
+        report.attempt = static_cast<uint64_t>(gamepad_input_attempt_count_);
+        report.buttons = opennow::input::ControllerEdgeState(buttons, left_trigger, right_trigger);
+        // Axis-only changes may be replaced, but button edges must stay in
+        // order even when several UI reports arrive in one transport batch.
+        constexpr size_t kMaximumButtonEdges = 8;
+        const auto queued_result = opennow::input::QueueControllerReport(
+            queued, std::move(report), kMaximumButtonEdges);
+        if (queued_result == opennow::input::ReportQueueResult::CoalescedAxes)
+            gamepad_reports_coalesced_.fetch_add(1, std::memory_order_relaxed);
+        else if (queued_result == opennow::input::ReportQueueResult::DroppedOldestEdge)
+            gamepad_button_edges_dropped_.fetch_add(1, std::memory_order_relaxed);
+        input_wake_generation_.fetch_add(1, std::memory_order_release);
+        interactive_input_pending_.store(true, std::memory_order_release);
     }
-    return sent >= 0;
+    network_wake_cv_.notify_one();
+    return true;
+}
+
+int WebRtcSession::flush_pending_gamepad_inputs_locked(size_t maximum_reports) {
+    if (!pc_ || !input_ready_ ||
+        peer_connection_get_state(pc_) != PEER_CONNECTION_COMPLETED)
+        return 0;
+    if (NowUs() < input_backpressure_until_us_)
+        return 0;
+
+    int flushed = 0;
+    const auto batch_started_us = NowUs();
+    const size_t first_index = next_gamepad_report_;
+    for (size_t checked = 0;
+         checked < pending_gamepad_reports_.size() &&
+             static_cast<size_t>(flushed) < maximum_reports;
+         ++checked) {
+        const size_t index =
+            (first_index + checked) % pending_gamepad_reports_.size();
+        PendingGamepadReport report;
+        {
+            std::lock_guard<std::mutex> queue_lock(outbound_input_mutex_);
+            if (pending_gamepad_reports_[index].empty())
+                continue;
+            report = std::move(pending_gamepad_reports_[index].front());
+            pending_gamepad_reports_[index].pop_front();
+        }
+
+        const uint64_t send_started_us = NowUs();
+        if (report.queued_at_us > 0 && send_started_us >= report.queued_at_us) {
+            const uint64_t wait_us = send_started_us - report.queued_at_us;
+            AtomicMax(input_queue_wait_us_max_, wait_us);
+            input_queue_window_.Observe(wait_us);
+            RecordLatency(input_queue_wait_buckets_, wait_us);
+        }
+        const int sent = send_datachannel_binary(
+            report.sid, "gamepad", report.wire_payload.data(),
+            report.wire_payload.size());
+        const uint64_t send_us = NowUs() - send_started_us;
+        AtomicMax(input_send_us_max_, send_us);
+        input_send_window_.Observe(send_us);
+        RecordLatency(input_send_buckets_, send_us);
+        if (sent == SCTP_SEND_WINDOW_FULL) {
+            input_backpressure_count_.fetch_add(1);
+            input_backpressure_until_us_ = NowUs() + 15000;
+        } else if (sent < 0) {
+            gamepad_send_failure_count_++;
+        } else {
+            gamepad_tx_count_++;
+        }
+
+        if (report.attempt <= 12 || gamepad_tx_count_ <= 8 ||
+            report.attempt % 100 == 0 || sent < 0) {
+            AppendInputLog("PAD tx attempt=" + std::to_string(report.attempt) +
+                           " report=" + std::to_string(gamepad_tx_count_) +
+                           " sid=" + std::to_string(report.sid) +
+                           " controller=" + std::to_string(report.controller_id) +
+                           " queuedUs=" +
+                               std::to_string(send_started_us - report.queued_at_us) +
+                           " wireBytes=" +
+                               std::to_string(report.wire_payload.size()) +
+                           " sent=" + std::to_string(sent));
+        }
+        if (sent < 0) {
+            std::lock_guard<std::mutex> queue_lock(outbound_input_mutex_);
+            pending_gamepad_reports_[index].push_front(std::move(report));
+        }
+        next_gamepad_report_ = (index + 1) % pending_gamepad_reports_.size();
+        flushed++;
+        if (sent == SCTP_SEND_WINDOW_FULL ||
+            opennow::input::EndInputBatch(static_cast<unsigned>(flushed), NowUs() - batch_started_us))
+            break;
+    }
+
+    bool pending = false;
+    {
+        std::lock_guard<std::mutex> queue_lock(outbound_input_mutex_);
+        for (const auto& report : pending_gamepad_reports_)
+            pending = pending || !report.empty();
+        interactive_input_pending_.store(pending, std::memory_order_release);
+    }
+    return flushed;
+}
+
+bool WebRtcSession::has_pending_gamepad_inputs() const {
+    std::lock_guard<std::mutex> queue_lock(outbound_input_mutex_);
+    return std::any_of(pending_gamepad_reports_.begin(), pending_gamepad_reports_.end(),
+        [](const auto& reports) { return !reports.empty(); });
+}
+
+void WebRtcSession::clear_pending_gamepad_inputs() {
+    std::lock_guard<std::mutex> queue_lock(outbound_input_mutex_);
+    for (auto& report : pending_gamepad_reports_)
+        report.clear();
+    interactive_input_pending_.store(false, std::memory_order_release);
 }
 
 void WebRtcSession::send_mouse_left_button(bool pressed) {
     interactive_input_pending_.store(true, std::memory_order_release);
     std::lock_guard<std::recursive_mutex> lock(peer_mutex_);
-    interactive_input_pending_.store(false, std::memory_order_release);
+    interactive_input_pending_.store(has_pending_gamepad_inputs(), std::memory_order_release);
     if (!pc_ || !input_ready_ || peer_connection_get_state(pc_) != PEER_CONNECTION_COMPLETED) {
         AppendInputLog("MOUSE blocked pressed=" + std::to_string(pressed ? 1 : 0) +
                        " pc=" + std::to_string(pc_ ? 1 : 0) +
@@ -328,7 +442,7 @@ void WebRtcSession::send_mouse_move(int16_t dx, int16_t dy) {
 
     interactive_input_pending_.store(true, std::memory_order_release);
     std::lock_guard<std::recursive_mutex> lock(peer_mutex_);
-    interactive_input_pending_.store(false, std::memory_order_release);
+    interactive_input_pending_.store(has_pending_gamepad_inputs(), std::memory_order_release);
     if (!pc_ || !input_ready_ || peer_connection_get_state(pc_) != PEER_CONNECTION_COMPLETED) {
         AppendInputLog("MOUSE_MOVE blocked dx=" + std::to_string(dx) +
                        " dy=" + std::to_string(dy));
@@ -345,16 +459,16 @@ void WebRtcSession::send_mouse_move(int16_t dx, int16_t dy) {
                    " dy=" + std::to_string(dy) + " sent=" + std::to_string(sent));
 }
 
-void WebRtcSession::send_keyboard_key(uint16_t keycode, uint16_t scancode,
+bool WebRtcSession::send_keyboard_key(uint16_t keycode, uint16_t scancode,
                                       uint16_t modifiers, bool pressed) {
     interactive_input_pending_.store(true, std::memory_order_release);
     std::lock_guard<std::recursive_mutex> lock(peer_mutex_);
-    interactive_input_pending_.store(false, std::memory_order_release);
+    interactive_input_pending_.store(has_pending_gamepad_inputs(), std::memory_order_release);
     if (!pc_ || !input_ready_ || peer_connection_get_state(pc_) != PEER_CONNECTION_COMPLETED) {
         if (!opennow::SensitiveInputLoggingSuppressed())
             AppendInputLog("KEY blocked vk=" + std::to_string(keycode) +
                            " pressed=" + std::to_string(pressed ? 1 : 0));
-        return;
+        return false;
     }
 
     const uint64_t timestamp_us = NowUs();
@@ -368,6 +482,7 @@ void WebRtcSession::send_keyboard_key(uint16_t keycode, uint16_t scancode,
                        " mods=" + std::to_string(modifiers) +
                        " pressed=" + std::to_string(pressed ? 1 : 0) +
                        " sent=" + std::to_string(sent));
+    return sent >= 0;
 }
 
 
@@ -404,13 +519,14 @@ void WebRtcSession::on_datachannel_message(const char* msg, size_t len, uint16_t
 
         if (handshake) {
             input_ready_ = true;
+            input_delivery_ready_.store(true, std::memory_order_release);
             input_protocol_version_ = std::max(2, version);
             AppendStreamLog("DATA input_handshake_complete version=" +
                             std::to_string(input_protocol_version_) +
                             " firstWord=" + std::to_string(first_word));
             AppendInputLog("HANDSHAKE complete protocol=" + std::to_string(input_protocol_version_) +
                            " firstWord=" + std::to_string(first_word));
-            maybe_send_input_heartbeat();
+            // The network worker sends the first heartbeat after draining input.
         }
     }
 }
@@ -437,11 +553,14 @@ int WebRtcSession::next_ack_id() {
 }
 
 void WebRtcSession::send_peer_info() {
-    if (!signaling_client_)
+    if (cloud_client_profile_==opennow::gfn::cloud_session::ClientProfile::BrowserWebRtc ||
+        !signaling_client_ || signaling_registration_.Confirmed() ||
+        signaling_registration_.Attempts()>=opennow::signaling::RegistrationPolicy::MaximumAttempts)
         return;
 
     json_t* root = json_object();
-    json_object_set_new(root, "ackid", json_integer(next_ack_id()));
+    const auto registration_request_id=next_ack_id();
+    json_object_set_new(root, "ackid", json_integer(registration_request_id));
 
     json_t* info = json_object();
     json_object_set_new(info, "browser", json_string("Chrome"));
@@ -458,10 +577,14 @@ void WebRtcSession::send_peer_info() {
     char* dump = json_dumps(root, 0);
     if (dump) {
         AppendStreamLog("TX " + std::string(dump));
-        signaling_client_->send_message(std::string(dump));
+        const bool written=signaling_client_->send_message(std::string(dump));
+        signaling_registration_.Sent(registration_request_id,written,NowUs());
+        AppendStreamLog(signaling_diagnostics_.Registration(registration_request_id,written,std::strlen(dump)));
         free(dump);
+    } else {
+        signaling_registration_.Sent(registration_request_id,false,NowUs());
+        AppendStreamLog(signaling_diagnostics_.Registration(registration_request_id,false,0));
     }
-    last_peer_info_sent_ = std::chrono::steady_clock::now();
     json_decref(root);
 }
 
@@ -520,9 +643,8 @@ void WebRtcSession::maybe_send_keepalive() {
         send_heartbeat();
     }
 
-    if (!offer_received_ &&
-        (last_peer_info_sent_.time_since_epoch().count() == 0 ||
-         now - last_peer_info_sent_ >= std::chrono::seconds(2))) {
+    if (!offer_received_.load() && signaling_registration_.ShouldSend(
+            signaling_client_->is_connected(),false,NowUs())) {
         send_peer_info();
     }
 }
@@ -586,17 +708,24 @@ void WebRtcSession::reset_input_channel_for_retry(const char* reason) {
     reliable_input_channel_requested_ = false;
     partial_input_channel_requested_ = false;
     input_ready_ = false;
+    input_delivery_ready_.store(false, std::memory_order_release);
+    clear_pending_gamepad_inputs();
     startup_control_sent_ = false;
     input_activation_due_ = {};
     last_datachannel_open_attempt_ = {};
     last_input_heartbeat_sent_ = {};
     consecutive_input_send_failures_ = 0;
+    input_protocol_version_.store(2, std::memory_order_release);
     AppendInputLog(std::string("RECOVERY input_channel_reset reason=") +
                    (reason ? reason : "unknown") +
                    " attempts=" + std::to_string(datachannel_open_attempts_));
 }
 
 void WebRtcSession::note_input_send_result(int sent, const char* label) {
+    // A full reliable window means ACKs are late. Keep the negotiated channel
+    // and protocol intact; the pending controller report is retried on ACK.
+    if (sent == SCTP_SEND_WINDOW_FULL)
+        return;
     if (sent >= 0) {
         consecutive_input_send_failures_ = 0;
         return;
@@ -609,6 +738,7 @@ void WebRtcSession::note_input_send_result(int sent, const char* label) {
     // Do not keep acknowledging controller states locally while SCTP rejects
     // them. Pause briefly, then reactivate the negotiated reliable channel.
     input_ready_ = false;
+    input_delivery_ready_.store(false, std::memory_order_release);
     input_activation_due_ = std::chrono::steady_clock::now() +
                             std::chrono::milliseconds(250);
     AppendInputLog(std::string("RECOVERY input_send_failures label=") +
@@ -627,9 +757,12 @@ void WebRtcSession::maybe_activate_input() {
         return;
 
     input_ready_ = true;
-    input_protocol_version_ = 2;
-    AppendStreamLog("DATA input_ready fallback=v2 controller=xbox sidReliable=0 sidFast=2");
-    AppendInputLog("HANDSHAKE fallback protocol=2 inputReady=1 controller=xbox sid=0");
+    input_delivery_ready_.store(true, std::memory_order_release);
+    const int protocol = input_protocol_version_.load(std::memory_order_acquire);
+    AppendStreamLog("DATA input_ready protocol=" + std::to_string(protocol) +
+                    " controller=xbox sidReliable=0 sidFast=2");
+    AppendInputLog("HANDSHAKE reactivated protocol=" + std::to_string(protocol) +
+                   " inputReady=1 controller=xbox sid=0");
 }
 
 void WebRtcSession::send_datachannel_text(const std::string& label, const std::string& payload) {
@@ -648,16 +781,24 @@ int WebRtcSession::send_datachannel_binary(uint16_t sid, const std::string& labe
     if (!pc_ || !payload || size == 0)
         return -1;
 
+    const uint64_t sctp_started_us = NowUs();
     const int sent = peer_connection_datachannel_send_binary_sid(
         pc_,
         const_cast<char*>(reinterpret_cast<const char*>(payload)),
         size,
         sid);
+    const auto send_elapsed_us = NowUs() - sctp_started_us;
+    AtomicMax(input_sctp_us_max_, send_elapsed_us);
+    if (label == "gamepad") AtomicMax(gamepad_send_window_max_us_, send_elapsed_us);
+    if (label == "input_heartbeat") AtomicMax(heartbeat_send_window_max_us_, send_elapsed_us);
+    if (send_elapsed_us >= 8000 && (label == "gamepad" || label == "input_heartbeat"))
+        AppendInputLog("INPUT_SEND label=" + label + " elapsedUs=" + std::to_string(send_elapsed_us) +
+            " result=" + std::to_string(sent));
     note_input_send_result(sent, label.c_str());
     // Controller reports are sent every frame; logging each one would create
     // input latency and make the useful SCTP diagnostics unreadable.
     const bool high_frequency_input = label == "gamepad" || label == "input_heartbeat";
-    if (!high_frequency_input || gamepad_tx_count_ < 5 || gamepad_tx_count_ % 120 == 0) {
+    if (opennow::CanLogInputPayload(label) && (!high_frequency_input || gamepad_tx_count_ < 5 || gamepad_tx_count_ % 120 == 0)) {
         AppendStreamLog("DATA tx-binary label=" + label +
                         " sid=" + std::to_string(sid) +
                         " sent=" + std::to_string(sent) +
@@ -672,10 +813,10 @@ void WebRtcSession::maybe_send_input_heartbeat() {
         return;
 
     const auto now = std::chrono::steady_clock::now();
-    if (last_input_heartbeat_sent_.time_since_epoch().count() != 0 &&
-        now - last_input_heartbeat_sent_ < std::chrono::seconds(2)) {
-        return;
-    }
+    const auto now_us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count());
+    const auto previous_us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(last_input_heartbeat_sent_.time_since_epoch()).count());
+    if (!opennow::input::HeartbeatDue(now_us, previous_us,
+            interactive_input_pending_.load(std::memory_order_acquire))) return;
 
     last_input_heartbeat_sent_ = now;
     input_heartbeat_tx_count_++;

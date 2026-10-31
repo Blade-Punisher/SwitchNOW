@@ -25,6 +25,39 @@ inline PresentationState Classify(const AdBreakInfo& value)
                              : PresentationState::MediaReady;
 }
 
+struct WaitingPresentation
+{
+    const char* title;
+    const char* detail;
+    bool show_position;
+};
+
+// Queue and rig preparation remain visible even while NVIDIA keeps its
+// advertisement-required flag set after accepting a loading-error report.
+inline WaitingPresentation QueuePresentation(const SessionInfo& session)
+{
+    if (session.app_patching)
+        return {"Updating the game", "Setting up rig... Please wait.", false};
+    if (session.status == 2 || session.status == 3)
+        return {"Connecting to your cloud rig...", "Setting up rig... Please wait.", false};
+    if (session.status > 3 && session.status != 6)
+        return {"Waiting...", "Setting up rig... Please wait.", false};
+    if (session.queue_position > 0)
+        return {"Position in queue:{0}", "Waiting for an available cloud rig", true};
+    if (session.status == 0 || session.seat_setup_step == 1)
+        return {"Waiting in queue...", "Your cloud rig will start automatically when it is ready.", false};
+    return {session.app_patching ? "Updating the game" : "Preparing your cloud rig",
+            "Setting up rig... Please wait.", false};
+}
+
+inline int QueuePollDelayMs(const SessionInfo& session) {
+    if (session.app_patching || session.queue_position > 10 || session.status == 6)
+        return 5000;
+    // Refresh near the head of the queue and during rig preparation. There is
+    // no client countdown: only a new successful server reply changes position.
+    return session.queue_position >= 0 ? 2000 : 3000;
+}
+
 inline int TotalDurationSeconds(const AdBreakInfo& value)
 {
     int total = 0;

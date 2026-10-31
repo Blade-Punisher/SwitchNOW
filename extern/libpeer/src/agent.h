@@ -72,7 +72,11 @@ struct Agent {
   uint32_t rtt_probe_last_sample_ms;
   uint32_t rtt_probe_sequence;
   uint32_t rtt_current_ms;
+  uint32_t recv_select_ms;
+  uint32_t recv_read_ms;
+  uint32_t recv_stun_ms;
   uint32_t rtt_min_ms;
+  uint32_t rtt_median_ms;
   uint32_t rtt_p95_ms;
   uint32_t rtt_jitter_q4;
   uint32_t rtt_samples[AGENT_RTT_SAMPLE_WINDOW];
@@ -109,6 +113,7 @@ typedef struct AgentRttStats {
   int current_ms;
   int smoothed_ms;
   int min_ms;
+  int median_ms;
   int p95_ms;
   int jitter_ms;
   uint32_t sample_age_ms;

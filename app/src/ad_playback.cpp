@@ -1,6 +1,8 @@
+#include "localization.hpp"
 #include "ad_playback.hpp"
 
 #include "app_paths.hpp"
+#include "advertisement_source.hpp"
 #include "media_input_policy.hpp"
 #include "runtime_journal.hpp"
 #include "stream/deko3d/DKVideoRenderer.hpp"
@@ -266,16 +268,6 @@ struct SwrDeleter
     }
 };
 
-bool LooksLikeDirectFile(const AdMediaFileInfo& media)
-{
-    std::string value = media.encoding_profile + " " + media.url;
-    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
-        return static_cast<char>(std::tolower(ch));
-    });
-    return value.find("mp4") != std::string::npos ||
-           value.find("webm") != std::string::npos;
-}
-
 struct MediaInterruptContext
 {
     const std::function<bool()>* is_cancelled = nullptr;
@@ -413,7 +405,7 @@ void AdvertisementPlaybackView::draw(
     nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
     nvgFontSize(vg, 14.0f);
     nvgFillColor(vg, nvgRGB(77, 218, 130));
-    nvgText(vg, x + 22.0f, y + 21.0f, "ADVERTISEMENT", nullptr);
+    nvgText(vg, x + 22.0f, y + 21.0f, opennow::Tr("ADVERTISEMENT").c_str(), nullptr);
     nvgFontSize(vg, 22.0f);
     nvgFillColor(vg, nvgRGB(245, 247, 249));
     nvgText(vg, x + 22.0f, y + 49.0f, title.c_str(), nullptr);
@@ -434,7 +426,7 @@ void AdvertisementPlaybackView::draw(
     nvgFontSize(vg, 17.0f);
     nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
     nvgFillColor(vg, nvgRGB(226, 231, 235));
-    nvgText(vg, x + 22.0f, y + height - 62.0f, status.c_str(), nullptr);
+    nvgText(vg, x + 22.0f, y + height - 62.0f, opennow::TrMessage(status).c_str(), nullptr);
     if (duration_ms > 0)
     {
         const int remaining = std::max(0, duration_ms - watched_ms + 999) / 1000;
@@ -455,7 +447,7 @@ AdvertisementPlaybackResult PlayAdvertisementMedia(
     const std::function<void()>& on_started)
 {
     AdvertisementPlaybackResult result;
-    std::string downloaded;
+    std::unique_ptr<AdvertisementSource> prepared;
     const auto cancelled = [&]() {
         return is_cancelled && is_cancelled();
     };
@@ -468,32 +460,26 @@ AdvertisementPlaybackResult PlayAdvertisementMedia(
             throw std::runtime_error("NVIDIA did not provide advertisement media");
 
         std::string input = media.url;
-        if (LooksLikeDirectFile(media))
+        if (media.url.rfind("https://", 0) == 0 || media.url.rfind("http://", 0) == 0)
         {
-            downloaded = AppHomePath() + "/queue_ad_media";
-            LogRuntimeEvent(
-                "session", "ad_media_download_started",
-                "profile=" + media.encoding_profile + " transport=https");
             state->SetProgress(0, "Downloading advertisement...");
-            http_client.DownloadToFile(
-                media.url, downloaded,
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                {},
-                [state](long long received, long long total) {
-                    if (total > 0)
-                    {
-                        const int percent = static_cast<int>(
-                            std::clamp(received * 100 / total, 0LL, 100LL));
-                        state->SetProgress(
-                            0, "Downloading advertisement... " +
-                            std::to_string(percent) + "%");
-                    }
-                },
-                cancelled);
-            input = media_input::FfmpegLocalFileUrl(downloaded);
-            LogRuntimeEvent(
-                "session", "ad_media_download_completed",
-                "profile=" + media.encoding_profile + " input=file");
+            prepared = std::make_unique<AdvertisementSource>(
+                AppHomePath() + "/queue_ad_media",
+                [&](const std::string& url, const std::string& path) {
+                    std::string effective_url;
+                    http_client.DownloadToFile(url, path,
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", {},
+                        [state](long long received, long long total) {
+                            if (total > 0) state->SetProgress(0,
+                                "Downloading advertisement... " + std::to_string(
+                                    std::clamp(received * 100 / total, 0LL, 100LL)) + "%");
+                        }, cancelled, &effective_url);
+                    return effective_url;
+                }, cancelled, [](const std::string& detail) {
+                    LogRuntimeEvent("session", "ad_source_inspected", detail);
+                });
+            input = media_input::FfmpegLocalFileUrl(prepared->Prepare(media.url));
+            LogRuntimeEvent("session", "ad_media_download_completed", "input=file source=resolved");
         }
         if (cancelled())
         {
@@ -511,7 +497,12 @@ AdvertisementPlaybackResult PlayAdvertisementMedia(
             "session", "ad_media_open_started",
             "profile=" + media.encoding_profile +
             " input=" + (input.rfind("file:", 0) == 0 ? "file" : "network"));
-        int error = avformat_open_input(&raw_format, input.c_str(), nullptr, nullptr);
+        AVDictionary* format_options = nullptr;
+        // Prepared HLS resources use extensionless local cache paths. Their
+        // origins were restricted to HTTP(S) by AdvertisementSource.
+        if (prepared) av_dict_set(&format_options, "allowed_extensions", "ALL", 0);
+        int error = avformat_open_input(&raw_format, input.c_str(), nullptr, &format_options);
+        av_dict_free(&format_options);
         if (error < 0)
         {
             if (raw_format)
@@ -865,8 +856,7 @@ AdvertisementPlaybackResult PlayAdvertisementMedia(
         LogRuntimeEvent("session", "ad_playback_failed", result.error);
     }
 
-    if (!downloaded.empty())
-        std::remove(downloaded.c_str());
+    prepared.reset();
 
     if (result.started && result.watched_time_ms <= 0)
         result.watched_time_ms = static_cast<int>(

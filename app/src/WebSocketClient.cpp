@@ -2,12 +2,15 @@
 #include <iostream>
 #include <borealis.hpp>
 #include <array>
+#include <algorithm>
 #include <cstring>
 #include <cstdint>
 #include <limits>
 #include <random>
 #include <thread>
 #include <chrono>
+#include <cctype>
+#include <sstream>
 
 #ifdef __SWITCH__
 #include <switch.h>
@@ -15,6 +18,11 @@
 
 namespace
 {
+
+constexpr size_t kMaximumHandshakeBytes = 64 * 1024;
+constexpr size_t kMaximumSignalingPayloadBytes = 4 * 1024 * 1024;
+constexpr size_t kMaximumPollReadBytes = 64 * 1024;
+constexpr size_t kMaximumFramesPerPoll = 16;
 
 std::vector<uint8_t> random_bytes(size_t length)
 {
@@ -60,6 +68,24 @@ bool starts_with(const std::string& value, const char* prefix)
     return value.rfind(prefix, 0) == 0;
 }
 
+std::string header_value(const std::string& response, std::string key) {
+    std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) { return std::tolower(c); });
+    std::istringstream lines(response.substr(0,response.find("\r\n\r\n")));
+    std::string line;
+    while (std::getline(lines,line)) {
+        const auto colon=line.find(':');
+        if(colon==std::string::npos) continue;
+        auto name=line.substr(0,colon);
+        std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return std::tolower(c); });
+        if(name!=key) continue;
+        const auto start=line.find_first_not_of(" \t",colon+1);
+        if(start==std::string::npos) return {};
+        const auto end=line.find_last_not_of(" \t\r");
+        return line.substr(start,end-start+1);
+    }
+    return {};
+}
+
 bool is_successful_handshake(const std::string& response)
 {
     const size_t line_end = response.find("\r\n");
@@ -88,6 +114,11 @@ bool WebSocketClient::connect() {
 
     last_error_.clear();
     rx_buffer_.clear();
+    message_buffer_.clear();
+    fragmented_message_ = false;
+    receive_ = {};
+    requested_subprotocol_ = selected_subprotocol_ = matched_subprotocol_ = false;
+    upgrade_status_ = 0;
 
     // Parse URL for host and path (very basic parsing)
     std::string host = url_;
@@ -148,6 +179,8 @@ bool WebSocketClient::connect() {
         handshake += h + "\r\n";
     }
     handshake += "\r\n";
+    const auto expected_protocol = header_value(handshake,"Sec-WebSocket-Protocol");
+    requested_subprotocol_ = !expected_protocol.empty();
 
     if (!send_all(reinterpret_cast<const uint8_t*>(handshake.data()), handshake.size()))
         return false;
@@ -162,10 +195,22 @@ bool WebSocketClient::connect() {
         res = curl_easy_recv(curl_, buf, sizeof(buf) - 1, &rcvd);
         if (res == CURLE_OK && rcvd > 0) {
             response.append(buf, rcvd);
+            if (response.size() > kMaximumHandshakeBytes) {
+                last_error_ = "WebSocket handshake response is too large";
+                break;
+            }
             const size_t header_end = response.find("\r\n\r\n");
             if (header_end == std::string::npos)
                 continue;
 
+            {
+                std::istringstream status(response.substr(0,response.find("\r\n")));
+                std::string protocol;
+                status >> protocol >> upgrade_status_;
+                const auto selected=header_value(response,"Sec-WebSocket-Protocol");
+                selected_subprotocol_ = !selected.empty();
+                matched_subprotocol_ = requested_subprotocol_ && selected==expected_protocol;
+            }
             if (is_successful_handshake(response)) {
                 const size_t body_start = header_end + 4;
                 if (response.size() > body_start) {
@@ -198,6 +243,26 @@ void WebSocketClient::disconnect() {
         send_frame(0x88, close_payload, sizeof(close_payload));
         connected_ = false;
     }
+    message_buffer_.clear();
+    fragmented_message_ = false;
+    rx_buffer_.clear();
+}
+
+std::string WebSocketClient::get_receive_diagnostics() const {
+    return "http=" + std::to_string(upgrade_status_) +
+        " protocolRequested=" + std::to_string(requested_subprotocol_) +
+        " protocolSelected=" + std::to_string(selected_subprotocol_) +
+        " protocolMatched=" + std::to_string(matched_subprotocol_) +
+        " framesText=" + std::to_string(receive_.text) +
+        " framesBinary=" + std::to_string(receive_.binary) +
+        " framesContinuation=" + std::to_string(receive_.continuation) +
+        " ping=" + std::to_string(receive_.ping) + " pong=" + std::to_string(receive_.pong) +
+        " close=" + std::to_string(receive_.close) + " messages=" + std::to_string(receive_.messages) +
+        " fragmentedMessages=" + std::to_string(receive_.fragmented) +
+        " fragmentPending=" + std::to_string(fragmented_message_) +
+        " fragmentBytes=" + std::to_string(message_buffer_.size()) +
+        " bufferedBytes=" + std::to_string(rx_buffer_.size()) +
+        " protocolErrors=" + std::to_string(receive_.protocol_errors);
 }
 
 bool WebSocketClient::send_all(const uint8_t* data, size_t length) {
@@ -266,20 +331,29 @@ bool WebSocketClient::send_frame(uint8_t opcode, const uint8_t* payload, size_t 
     return send_all(frame.data(), frame.size());
 }
 
-void WebSocketClient::send_message(const std::string& msg) {
-    send_frame(0x81, (const uint8_t*)msg.data(), msg.length());
+bool WebSocketClient::send_message(const std::string& msg) {
+    return send_frame(0x81, reinterpret_cast<const uint8_t*>(msg.data()), msg.length());
 }
 
 void WebSocketClient::poll() {
     if (!connected_ || !curl_) return;
 
-    // Read all available data into rx_buffer_
+    // Bound work per UI tick. Signaling bursts must not monopolize the render
+    // thread while a stream is starting or input is being submitted.
     uint8_t temp[4096];
-    while (true) {
+    size_t bytes_read = 0;
+    while (bytes_read < kMaximumPollReadBytes) {
         size_t rcvd = 0;
-        CURLcode res = curl_easy_recv(curl_, temp, sizeof(temp), &rcvd);
+        const size_t capacity = std::min(sizeof(temp), kMaximumPollReadBytes - bytes_read);
+        CURLcode res = curl_easy_recv(curl_, temp, capacity, &rcvd);
         if (res == CURLE_OK && rcvd > 0) {
             rx_buffer_.insert(rx_buffer_.end(), temp, temp + rcvd);
+            bytes_read += rcvd;
+            if (rx_buffer_.size() + message_buffer_.size() > kMaximumSignalingPayloadBytes + kMaximumPollReadBytes + 14) {
+                last_error_ = "Incoming WebSocket buffer is too large";
+                connected_ = false;
+                return;
+            }
         } else {
             if (res == CURLE_OK && rcvd == 0) {
                 last_error_ = "Remote endpoint closed the signaling connection";
@@ -292,79 +366,95 @@ void WebSocketClient::poll() {
         }
     }
 
-    // Process all complete frames in the buffer
-    while (rx_buffer_.size() >= 2) {
-        uint8_t opcode = rx_buffer_[0] & 0x0F;
-        uint8_t payload_len_7 = rx_buffer_[1] & 0x7F;
-        bool masked = (rx_buffer_[1] & 0x80) != 0;
-        
+    const auto protocol_error = [&](const char* message) {
+        last_error_ = message;
+        ++receive_.protocol_errors;
+        connected_ = false;
+        message_buffer_.clear();
+        fragmented_message_ = false;
+    };
+    size_t frames_processed = 0;
+    while (connected_ && rx_buffer_.size() >= 2 && frames_processed < kMaximumFramesPerPoll) {
+        const bool final = (rx_buffer_[0] & 0x80) != 0;
+        const uint8_t opcode = rx_buffer_[0] & 0x0F;
+        const uint8_t short_length = rx_buffer_[1] & 0x7F;
+        const bool masked = (rx_buffer_[1] & 0x80) != 0;
+        const bool control = opcode >= 8;
+        if ((rx_buffer_[0] & 0x70) ||
+            (opcode != 0 && opcode != 1 && opcode != 2 && opcode != 8 && opcode != 9 && opcode != 10) ||
+            (control && (!final || short_length > 125))) {
+            protocol_error("Invalid WebSocket frame header"); return;
+        }
         size_t header_size = 2;
-        size_t payload_len = payload_len_7;
-        
-        if (payload_len_7 == 126) {
+        uint64_t length = short_length;
+        if (short_length == 126) {
             header_size += 2;
-            if (rx_buffer_.size() < header_size) return; // Need more data
-            payload_len = (static_cast<size_t>(rx_buffer_[2]) << 8) | rx_buffer_[3];
-        } else if (payload_len_7 == 127) {
+            if (rx_buffer_.size() < header_size) return;
+            length = (static_cast<uint64_t>(rx_buffer_[2]) << 8) | rx_buffer_[3];
+        } else if (short_length == 127) {
             header_size += 8;
-            if (rx_buffer_.size() < header_size) return; // Need more data
-            uint64_t big_len = 0;
-            for (size_t i = 0; i < 8; ++i) {
-                big_len = (big_len << 8) | rx_buffer_[2 + i];
+            if (rx_buffer_.size() < header_size) return;
+            length = 0;
+            for (size_t i=0; i<8; ++i) length = (length << 8) | rx_buffer_[2+i];
+        }
+        if (length > kMaximumSignalingPayloadBytes ||
+            (opcode == 0 && length > kMaximumSignalingPayloadBytes-message_buffer_.size())) {
+            protocol_error("Incoming WebSocket message is too large"); return;
+        }
+        if ((opcode == 0 && !fragmented_message_) ||
+            ((opcode == 1 || opcode == 2) && fragmented_message_)) {
+            protocol_error("Invalid WebSocket continuation sequence"); return;
+        }
+        if (masked) header_size += 4;
+        const size_t payload_size = static_cast<size_t>(length);
+        if (rx_buffer_.size() < header_size + payload_size) return;
+        uint8_t mask[4] {};
+        if (masked) std::memcpy(mask,rx_buffer_.data()+header_size-4,4);
+        // Iterators permit end(); &vector[size()] invoked undefined operator[].
+        std::vector<uint8_t> payload(rx_buffer_.begin()+header_size,
+            rx_buffer_.begin()+header_size+payload_size);
+        if (masked) for (size_t i=0; i<payload.size(); ++i) payload[i] ^= mask[i%4];
+        rx_buffer_.erase(rx_buffer_.begin(),rx_buffer_.begin()+header_size+payload_size);
+        ++frames_processed;
+        if (opcode == 1) ++receive_.text;
+        else if (opcode == 2) ++receive_.binary;
+        else if (opcode == 0) ++receive_.continuation;
+        else if (opcode == 9) ++receive_.ping;
+        else if (opcode == 10) ++receive_.pong;
+        else if (opcode == 8) ++receive_.close;
+
+        if (opcode == 1 || opcode == 2) {
+            if (!final) {
+                message_buffer_ = std::move(payload);
+                fragmented_message_ = true;
+                continue;
             }
-            if (big_len > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
-                last_error_ = "Incoming WebSocket frame is too large";
-                connected_ = false;
-                return;
-            }
-            payload_len = static_cast<size_t>(big_len);
-        }
-        
-        if (masked) {
-            header_size += 4;
-        }
-        
-        if (rx_buffer_.size() < header_size + payload_len) {
-            return; // Need more data for full frame payload
-        }
-        
-        // We have a full frame! Extract it
-        uint8_t mask_key[4] = {0};
-        if (masked) {
-            memcpy(mask_key, &rx_buffer_[header_size - 4], 4);
-        }
-        
-        std::vector<uint8_t> payload(&rx_buffer_[header_size], &rx_buffer_[header_size + payload_len]);
-        
-        if (masked) {
-            for (size_t i = 0; i < payload_len; i++) {
-                payload[i] ^= mask_key[i % 4];
-            }
-        }
-        
-        // Remove parsed frame from buffer
-        rx_buffer_.erase(rx_buffer_.begin(), rx_buffer_.begin() + header_size + payload_len);
-        
-        // Handle frame
-        if (opcode == 0x01) { // Text frame
-            std::string msg((char*)payload.data(), payload.size());
-            if (on_message_) on_message_(msg);
-        } else if (opcode == 0x08) { // Close frame
-            uint16_t close_code = 0;
-            if (payload.size() >= 2)
-                close_code = static_cast<uint16_t>((payload[0] << 8) | payload[1]);
-            std::string close_reason;
-            if (payload.size() > 2)
-                close_reason.assign(payload.begin() + 2, payload.end());
+        } else if (opcode == 0) {
+            message_buffer_.insert(message_buffer_.end(),payload.begin(),payload.end());
+            if (!final) continue;
+            payload = std::move(message_buffer_);
+            message_buffer_.clear();
+            fragmented_message_ = false;
+            ++receive_.fragmented;
+        } else if (opcode == 8) {
+            if (payload.size()==1) { protocol_error("Invalid WebSocket close payload"); return; }
+            uint16_t code = payload.size()>=2 ? static_cast<uint16_t>((payload[0]<<8)|payload[1]) : 0;
             last_error_ = "Signaling closed";
-            if (close_code != 0)
-                last_error_ += " code=" + std::to_string(close_code);
-            if (!close_reason.empty())
-                last_error_ += " reason=" + close_reason;
-            send_frame(0x88, payload.data(), payload.size());
+            if (code) last_error_ += " code="+std::to_string(code);
+            if (payload.size()>2) last_error_ += " reason="+std::string(payload.begin()+2,payload.end());
+            send_frame(0x88,payload.data(),payload.size());
             connected_ = false;
-        } else if (opcode == 0x09) { // Ping frame
-            send_frame(0x8A, payload.data(), payload.size()); // Send Pong
+            message_buffer_.clear(); fragmented_message_ = false;
+            continue;
+        } else if (opcode == 9) {
+            send_frame(0x8A,payload.data(),payload.size());
+            continue;
+        } else { // Pong is independent of an unfinished message.
+            continue;
         }
+        ++receive_.messages;
+        // Desktop handles both text and binary UTF-8 signaling JSON. Deliver
+        // once, only after FIN; the existing JSON parser validates its content.
+        if (on_message_) on_message_(std::string(payload.begin(),payload.end()));
     }
 }

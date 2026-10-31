@@ -35,9 +35,11 @@ class TopBarFrame : public brls::Box
     brls::Label* status_label_;
     std::string displayed_avatar_url_;
     std::string displayed_status_;
+    std::string displayed_language_;
 
     struct TabInfo {
         std::string label;
+        std::string language;
         TabViewCreator creator;
         brls::Label* header_label;
         brls::Rectangle* underline;

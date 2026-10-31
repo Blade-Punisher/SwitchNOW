@@ -33,9 +33,10 @@ void SignalingClient::poll() {
     }
 }
 
-void SignalingClient::send_message(const std::string& msg) {
+bool SignalingClient::send_message(const std::string& msg) {
     brls::Logger::info("Signaling Tx: {}", msg);
     if (ws_) {
-        ws_->send_message(msg);
+        return ws_->send_message(msg);
     }
+    return false;
 }

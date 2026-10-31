@@ -1,4 +1,7 @@
 #pragma once
+#include <string>
+#include <string_view>
+#include "diagnostic_file.hpp"
 
 namespace opennow
 {
@@ -9,5 +12,8 @@ void SetStreamDiagnosticsEnabled(bool enabled);
 bool StreamDiagnosticsEnabled();
 void SetSensitiveInputLoggingSuppressed(bool suppressed);
 bool SensitiveInputLoggingSuppressed();
+bool CanLogInputPayload(std::string_view label);
+void AppendAudioDiagnostic(std::string line);
+std::vector<diagnostics::FileSnapshot> CaptureStreamDiagnosticFiles();
 
 } // namespace opennow

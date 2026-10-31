@@ -12,11 +12,23 @@ struct Version
 {
     std::array<std::uint64_t, 3> core {};
     std::uint64_t revision = 0;
+    bool test = false;
 };
 
 inline bool ParseVersion(std::string text, Version& version)
 {
     version = {};
+    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back()))) text.pop_back();
+    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front()))) text.erase(text.begin());
+    for (char& c : text) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    for (const std::string& separator : {std::string(" r"), std::string(" test")}) {
+        const auto at = text.find(separator);
+        if (at != std::string::npos) text[at] = '-';
+    }
+    if (text.size() >= 5 && text.substr(text.size() - 5) == "-test") {
+        text.resize(text.size() - 5);
+        version.test = true;
+    }
     if (!text.empty() && (text.front() == 'v' || text.front() == 'V'))
         text.erase(text.begin());
 
@@ -78,6 +90,7 @@ inline bool IsNewerVersion(const std::string& candidate, const std::string& curr
         return false;
     if (left.core != right.core)
         return left.core > right.core;
+    if (left.test != right.test) return !left.test;
     return left.revision > right.revision;
 }
 

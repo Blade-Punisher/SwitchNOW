@@ -1,9 +1,20 @@
 #include <errno.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include "udp_receive_batch.h"
+#if defined(__SWITCH__)
+// libnx defines msghdr/mmsghdr/iovec in sys/socket.h (no sys/uio.h).
+#define UDP_HAS_RECVMMSG 1
+#elif defined(__linux__) && defined(_GNU_SOURCE)
+#include <sys/uio.h>
+#define UDP_HAS_RECVMMSG 1
+#endif
 
 #include "socket.h"
 #include "utils.h"
+_Static_assert(UDP_RECEIVE_BATCH_BYTES >= CONFIG_MTU, "UDP batch must fit a complete transport datagram");
 
 int udp_socket_add_multicast_group(UdpSocket* udp_socket, Address* mcast_addr) {
   int ret = 0;
@@ -28,6 +39,8 @@ int udp_socket_add_multicast_group(UdpSocket* udp_socket, Address* mcast_addr) {
 }
 
 int udp_socket_open(UdpSocket* udp_socket, int family, int port) {
+  udp_socket->receive_batch = NULL;
+  udp_socket->receive_batch_primed = 0;
   int ret;
   int reuse = 1;
   int receive_buffer = 2 * 1024 * 1024;
@@ -62,6 +75,12 @@ int udp_socket_open(UdpSocket* udp_socket, int family, int port) {
   }
 
   do {
+    const int flags = fcntl(udp_socket->fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(udp_socket->fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+      LOGE("Failed to make UDP socket nonblocking: %s", strerror(errno));
+      ret = -1;
+      break;
+    }
     if (setsockopt(udp_socket->fd, SOL_SOCKET, SO_RCVBUF,
                    &receive_buffer, sizeof(receive_buffer)) < 0) {
       LOGW("Failed to enlarge UDP receive buffer: %s", strerror(errno));
@@ -107,10 +126,57 @@ int udp_socket_open(UdpSocket* udp_socket, int family, int port) {
 }
 
 void udp_socket_close(UdpSocket* udp_socket) {
-  if (udp_socket->fd > 0) {
+  free(udp_socket->receive_batch);
+  udp_socket->receive_batch = NULL;
+  if (udp_socket->fd >= 0) {
     close(udp_socket->fd);
+    udp_socket->fd = -1;
   }
 }
+
+int udp_socket_enable_receive_batch(UdpSocket* udp_socket) {
+#if UDP_HAS_RECVMMSG
+  if (!udp_socket->receive_batch && udp_socket->fd >= 0)
+    udp_socket->receive_batch = calloc(1, sizeof(UdpReceiveBatch));
+  return udp_socket->receive_batch != NULL;
+#else
+  (void)udp_socket;
+  return 0;
+#endif
+}
+
+#if UDP_HAS_RECVMMSG
+static int udp_socket_receive_many(void* context, UdpReceiveRecord* records, unsigned count) {
+  UdpSocket* socket = context;
+  struct mmsghdr messages[UDP_RECEIVE_BATCH_CAPACITY] = {0};
+  struct iovec vectors[UDP_RECEIVE_BATCH_CAPACITY];
+  struct sockaddr_storage addresses[UDP_RECEIVE_BATCH_CAPACITY];
+  for (unsigned i = 0; i < count; ++i) {
+    vectors[i].iov_base = records[i].data;
+    vectors[i].iov_len = sizeof(records[i].data);
+    messages[i].msg_hdr.msg_iov = &vectors[i];
+    messages[i].msg_hdr.msg_iovlen = 1;
+    messages[i].msg_hdr.msg_name = &addresses[i];
+    messages[i].msg_hdr.msg_namelen = sizeof(addresses[i]);
+  }
+  // No MSG_WAITFORONE and no timeout: MSG_DONTWAIT drains only available data.
+  const int received = recvmmsg(socket->fd, messages, count, MSG_DONTWAIT, NULL);
+  if (received < 0) {
+    if (errno == ENOSYS || errno == EOPNOTSUPP || errno == EINVAL || errno == ENOMEM)
+      return UDP_RECEIVE_BATCH_UNSUPPORTED;
+    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return 0;
+    return -1;
+  }
+  for (int i = 0; i < received; ++i) {
+    records[i].size = (unsigned)messages[i].msg_len;
+    records[i].address_size = messages[i].msg_hdr.msg_namelen;
+    records[i].truncated = (messages[i].msg_hdr.msg_flags & MSG_TRUNC) != 0;
+    if (records[i].address_size <= sizeof(records[i].address))
+      memcpy(records[i].address, &addresses[i], records[i].address_size);
+  }
+  return received;
+}
+#endif
 
 int udp_socket_sendto(UdpSocket* udp_socket, Address* addr, const uint8_t* buf, int len) {
   struct sockaddr* sa;
@@ -136,7 +202,13 @@ int udp_socket_sendto(UdpSocket* udp_socket, Address* addr, const uint8_t* buf, 
       break;
   }
 
-  if ((ret = sendto(udp_socket->fd, buf, len, 0, sa, sock_len)) < 0) {
+  int send_flags = 0;
+#ifdef MSG_DONTWAIT
+  send_flags = MSG_DONTWAIT;
+#endif
+  if ((ret = sendto(udp_socket->fd, buf, len, send_flags, sa, sock_len)) < 0) {
+    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+      return -1;
     LOGE("Failed to sendto: %s", strerror(errno));
     return -1;
   }
@@ -170,11 +242,30 @@ int udp_socket_recvfrom(UdpSocket* udp_socket, Address* addr, uint8_t* buf, int 
       break;
   }
 
-  if ((ret = recvfrom(udp_socket->fd, buf, len, 0, sa, &sock_len)) < 0) {
+  int recv_flags = 0;
+#ifdef MSG_DONTWAIT
+  recv_flags = MSG_DONTWAIT;
+#endif
+  ret = UDP_RECEIVE_BATCH_UNSUPPORTED;
+#if UDP_HAS_RECVMMSG
+  if (udp_socket->receive_batch && udp_socket->receive_batch_primed) {
+    unsigned address_size = sock_len;
+    ret = udp_receive_batch_read(udp_socket->receive_batch, buf, (unsigned)len,
+                                sa, &address_size, udp_socket_receive_many, udp_socket);
+    if (ret >= 0) sock_len = (socklen_t)address_size;
+    if (ret == 0) { udp_socket->receive_batch_primed = 0; return 0; }
+  }
+#endif
+  if (ret == UDP_RECEIVE_BATCH_UNSUPPORTED)
+    ret = recvfrom(udp_socket->fd, buf, len, recv_flags, sa, &sock_len);
+  if (ret < 0) {
+    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+      return 0;
     LOGE("Failed to recvfrom: %s", strerror(errno));
     return -1;
   }
 
+  udp_socket->receive_batch_primed = ret > 0;
   if (addr) {
     switch (udp_socket->bind_addr.family) {
       case AF_INET6:

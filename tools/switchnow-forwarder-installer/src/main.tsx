@@ -2,9 +2,9 @@ import { AppletType, HidNpadButton } from '@nx.js/constants';
 import { installNsp } from '@nx.js/install-title';
 import { NcmStorageId } from '@nx.js/ncm';
 import { NACP } from '@tootallnate/nacp';
-import { useEffect, useState } from 'react';
-import { Rect, Text } from 'react-tela';
-import { render } from 'react-tela/render';
+import { paintInstaller } from './installer_canvas';
+import { prepareVisibleInstaller } from './preparation';
+import type { GameContext } from './installer_view';
 import type { Module } from './hacbrewpack';
 import { loadForwarderKeys } from './prod-keys';
 import { deterministicTitleId } from './util';
@@ -18,22 +18,54 @@ function waitForPaint(): Promise<void> {
   return new Promise((resolve) => requestAnimationFrame(() => resolve()));
 }
 
+const debugPath = 'sdmc:/switch/SwitchNOW/forwarder_debug.log';
+let debugLines = '';
+function trace(event: string) {
+  debugLines = (debugLines + `${new Date().toISOString()} FORWARDER ${event}\n`).slice(-24000);
+  try { Switch.writeFileSync(debugPath, debugLines); } catch { /* No SD logging must block install. */ }
+}
+trace('installer_start R63');
+let context: GameContext = {};
+try {
+  const bytes = Switch.readFileSync('sdmc:/switch/SwitchNOW/.shortcut/game_context.json');
+  context = bytes ? JSON.parse(new TextDecoder().decode(bytes)) : {};
+  trace('context_loaded');
+} catch { trace('context_unavailable'); }
+let stage = 0;
+let failed = false;
+let background: ImageBitmap | undefined;
+let painted = false;
+let backgroundPainted = false;
+let reportedFrameError = false;
+const canvas = screen.getContext('2d');
+if (!canvas) { trace('canvas_unavailable'); throw new Error('Installer canvas unavailable'); }
+async function loadBackground() {
+  if (!context.preview_background) return;
+  trace('background_read');
+  try {
+    const bytes = Switch.readFileSync(context.preview_background);
+    if (!bytes || bytes.byteLength > 12 * 1024 * 1024) throw new Error('background size');
+    background = await createImageBitmap(new Blob([bytes], { type: 'image/png' }));
+    trace(`background_ready ${background.width}x${background.height}`);
+  } catch { trace('background_unavailable'); }
+}
 function keepInstallerAlive() {
-  const rawButtons = navigator.getGamepads()[0]?.rawButtons ?? 0n;
-  const plusPressed =
-    (rawButtons & BigInt(HidNpadButton.Plus)) !== 0n;
-  if (!exitEnabled) {
-    plusReleasedAfterInstall = false;
-  } else {
-    if (!plusPressed) plusReleasedAfterInstall = true;
-    if (plusReleasedAfterInstall && plusPressed) Switch.exit();
+  try {
+    paintInstaller(canvas!, screen.width, screen.height, { language: context.language, stage, failed }, background);
+    if (!painted) { painted = true; trace('first_frame_painted'); }
+    if (background && !backgroundPainted) { backgroundPainted = true; trace('background_frame_painted'); }
+    const rawButtons = navigator.getGamepads()[0]?.rawButtons ?? 0n;
+    const plusPressed = (rawButtons & BigInt(HidNpadButton.Plus)) !== 0n;
+    if (!exitEnabled) plusReleasedAfterInstall = false;
+    else {
+      if (!plusPressed) plusReleasedAfterInstall = true;
+      if (plusReleasedAfterInstall && plusPressed) Switch.exit();
+    }
+  } catch {
+    if (!reportedFrameError) { reportedFrameError = true; trace('paint_or_input_failed'); }
   }
   requestAnimationFrame(keepInstallerAlive);
 }
-
-// Keep a native animation handle active from first paint through completion.
-// Without this, nx.js may stop after the install promise settles before React's
-// final state update reaches the framebuffer.
 requestAnimationFrame(keepInstallerAlive);
 
 interface InstallRequest {
@@ -44,6 +76,7 @@ interface InstallRequest {
   nroPath: string;
   returnPath: string;
   args: string;
+  automatic?: boolean;
 }
 
 function readRequest(): InstallRequest {
@@ -66,6 +99,7 @@ function readRequest(): InstallRequest {
 }
 
 async function returnToSwitchNow(request: InstallRequest): Promise<never> {
+  trace('return_requested');
   await waitForPaint();
   await waitForPaint();
   return new Switch.Application(request.returnPath).launch(
@@ -92,6 +126,11 @@ async function generateNsp(request: InstallRequest): Promise<Uint8Array> {
     let module: Module;
     void createModule({
       noInitialRun: true,
+      // Emscripten defaults to console.log/error. On Switch that activates the
+      // text console over the canvas, producing a black screen with raw output.
+      // Progress belongs to the game overlay; failures use the result channel.
+      print: () => {},
+      printErr: () => {},
       wasmBinary: wasm,
       preRun(instance: Module) {
         module = instance;
@@ -104,7 +143,7 @@ async function generateNsp(request: InstallRequest): Promise<Uint8Array> {
         const nacp = new NACP();
         nacp.id = titleId;
         nacp.title = request.name;
-        nacp.author = request.author || 'OpenCloudGaming';
+        nacp.author = request.author || 'Blade-Punisher';
         nacp.version = request.displayVersion || '0.0.6';
         nacp.startupUserAccount = 0;
         nacp.userAccountSaveDataSize = 0n;
@@ -146,98 +185,40 @@ async function generateNsp(request: InstallRequest): Promise<Uint8Array> {
   });
 }
 
-function Installer() {
-  const [heading, setHeading] = useState('Preparing HOME shortcut');
-  const [detail, setDetail] = useState('Reading the request from SwitchNOW...');
-  const [failed, setFailed] = useState(false);
-
-  useEffect(() => {
-    function writeResult(result: object) {
-      try {
-        Switch.writeFileSync(resultPath, JSON.stringify(result));
-      } catch {
-        // The on-screen result remains available if SD result logging fails.
-      }
-    }
-
-    async function install() {
-      if (Switch.appletType() !== AppletType.Application) {
-        throw new Error(
-          'Full-memory/application mode is required to install a forwarder.',
-        );
-      }
-      const request = readRequest();
-      setHeading(`Creating ${request.name}`);
-      setDetail('Building the personalized Horizon application...');
-      const nsp = await generateNsp(request);
-
-      setHeading(`Installing ${request.name}`);
-      setDetail('Writing the forwarder to SD storage. Do not power off.');
-      for await (const _event of installNsp(
-        new Blob([nsp]),
-        NcmStorageId.SdCard,
-      )) {
-        // The installer validates and commits each content record in order.
-      }
-
-      writeResult({
-        version: 1,
-        success: true,
-        name: request.name,
-        installedAt: Date.now(),
-      });
-      Switch.removeSync(requestPath);
-      setHeading(`${request.name} installed`);
-      setDetail(
-        'The NSP has been installed to the Horizon HOME screen.\n\n' +
-          'Returning to SwitchNOW...',
-      );
-      await returnToSwitchNow(request);
-    }
-
-    void install().catch(async (error: unknown) => {
-      const message = error instanceof Error ? error.message : String(error);
-      writeResult({ version: 1, success: false, error: message });
-      setFailed(true);
-      setHeading('Could not install the HOME shortcut');
-      setDetail(`${message}\n\nReturning to SwitchNOW...`);
-      try {
-        await returnToSwitchNow(readRequest());
-      } catch {
-        await waitForPaint();
-        await waitForPaint();
-        exitEnabled = true;
-      }
-    });
-  }, []);
-
-  return (
-    <>
-      <Rect fill='#0a0c0f' height={720} width={1280} x={0} y={0} />
-      <Text
-        fill={failed ? '#ff6b6b' : '#58d98a'}
-        fontSize={42}
-        x={72}
-        y={210}
-      >
-        {heading}
-      </Text>
-      {detail.split('\n').map((line, index) => (
-        <Text
-          key={`${index}-${line}`}
-          fill='#f2f4f7'
-          fontSize={25}
-          x={72}
-          y={290 + index * 38}
-        >
-          {line}
-        </Text>
-      ))}
-      <Text fill='#9098a5' fontSize={18} x={72} y={630}>
-        SwitchNOW Forwarder Installer - SD storage
-      </Text>
-    </>
-  );
+function writeResult(result: object) {
+  try { Switch.writeFileSync(resultPath, JSON.stringify(result)); trace('result_written'); }
+  catch { trace('result_write_failed'); }
 }
-
-render(<Installer />, screen);
+async function install() {
+  // Always show the progress panel before artwork decoding or synchronous WASM.
+  await waitForPaint(); await waitForPaint();
+  await prepareVisibleInstaller(loadBackground, waitForPaint);
+  trace('visible_preparation_ready');
+  if (Switch.appletType() !== AppletType.Application)
+    throw new Error('Full-memory/application mode is required to install a forwarder.');
+  const request = readRequest();
+  trace('request_valid');
+  stage = 1;
+  await waitForPaint(); await waitForPaint();
+  trace('nsp_generate_begin');
+  const nsp = await generateNsp(request);
+  trace('nsp_generate_done');
+  stage = 2;
+  await waitForPaint(); await waitForPaint();
+  trace('home_install_begin');
+  for await (const _event of installNsp(new Blob([nsp]), NcmStorageId.SdCard)) { }
+  trace('home_install_done');
+  writeResult({ version: 1, success: true, name: request.name, installedAt: Date.now(), automatic: !!request.automatic });
+  stage = 3;
+  await returnToSwitchNow(request);
+}
+void install().catch(async (error: unknown) => {
+  trace('install_failed');
+  const message = error instanceof Error ? error.message : String(error);
+  let automatic = false; let name = '';
+  try { const r = readRequest(); automatic = !!r.automatic; name = r.name; } catch { }
+  writeResult({ version: 1, success: false, name, error: message, automatic });
+  failed = true;
+  try { await returnToSwitchNow(readRequest()); }
+  catch { trace('return_failed'); exitEnabled = true; }
+});

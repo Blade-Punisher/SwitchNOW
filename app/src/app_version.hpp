@@ -3,6 +3,10 @@
 namespace opennow
 {
 
-inline constexpr const char* kAppVersion = "1.2.0";
+#ifndef SWITCHNOW_VERSION_STRING
+#define SWITCHNOW_VERSION_STRING "1.3.0"
+#endif
+
+inline constexpr const char* kAppVersion = SWITCHNOW_VERSION_STRING;
 
 } // namespace opennow

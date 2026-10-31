@@ -3,6 +3,7 @@
 #include "home_shortcut_policy.hpp"
 
 #include <cstddef>
+#include "models.hpp"
 #include <optional>
 #include <string>
 
@@ -39,8 +40,10 @@ RepairResult RepairLegacyShortcutManifests();
 std::optional<LaunchRequest> ReadLaunchRequest(int argc, char* argv[]);
 std::optional<InstallerResult> ConsumeInstallerResult();
 CreateResult CreateGameShortcut(LaunchRequest request);
+bool RefreshGameShortcut(LaunchRequest& request, AuthSession session);
 bool StartForwarderInstaller(
     const std::string& nro_path, const std::string& title,
-    std::string& error);
+    std::string& error, bool automatic = false);
+
 
 } // namespace opennow::shortcut

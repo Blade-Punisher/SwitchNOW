@@ -30,3 +30,20 @@ Thumbs.db
 *.suo
 __pycache__/
 node_modules/
+
+# Private data must never enter release/source exports
+/build-*/
+/build-tests/
+*.keys
+.env
+.env.*
+auth_accounts.json
+native_credentials.json
+proxy_credentials.json
+Genshin.txt
+Honkai.txt
+wuwa.txt
+zzz.txt
+Epic.txt
+!docs/autologin/*.txt
+/update_release*.json

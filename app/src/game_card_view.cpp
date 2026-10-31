@@ -1,6 +1,7 @@
 #include "game_card_view.hpp"
 
 #include "cover_image_cache.hpp"
+#include "card_viewport_policy.hpp"
 
 #include <utility>
 
@@ -48,7 +49,7 @@ GameCardView::GameCardView(GameCardDisplay display, ClickHandler click_handler)
     setFocusable(true);
     setHideHighlight(true);
 
-    image_ = new brls::Image();
+    image_ = new ThumbnailImage();
     image_->setWidth(212);
     image_->setHeight(112);
     image_->setMarginBottom(6);
@@ -63,7 +64,6 @@ GameCardView::GameCardView(GameCardDisplay display, ClickHandler click_handler)
     addView(subtitle_label_);
 
     UpdateChrome(false);
-    LoadImage();
 
     registerClickAction([this](brls::View* view) {
         (void)view;
@@ -94,7 +94,31 @@ void GameCardView::UpdateChrome(bool focused)
 
 void GameCardView::LoadImage()
 {
-    SetCachedThumbnailImage(image_, display_.image_url);
+    image_->Load(display_.image_url);
+}
+
+void GameCardView::frame(brls::FrameContext* ctx)
+{
+    const auto card = getFrame();
+    bool render = true, retain = true;
+    for (auto* parent = getParent(); parent; parent = parent->getParent()) {
+        if (!dynamic_cast<brls::ScrollingFrame*>(parent)) continue;
+        float top, right, bottom, left;
+        parent->getCullingBounds(&top, &right, &bottom, &left);
+        const ui::CardRect rect {card.getMinX(), card.getMinY(), card.getWidth(), card.getHeight()};
+        const ui::CardRect viewport {left, top, right - left, bottom - top};
+        render = ui::CardInViewport(rect, viewport, 20); // keep edge shadows intact
+        retain = ui::CardInViewport(rect, viewport, 2 * 190); // two warm rows
+        break;
+    }
+    if (!retain && thumbnail_active_) {
+        image_->Release(); thumbnail_active_ = false;
+    } else if (retain && !thumbnail_active_) {
+        thumbnail_active_ = true; LoadImage();
+    }
+    // Box's default leaf-only culling otherwise still paints every off-screen
+    // card background, border and shadow into the current command buffer.
+    if (render) brls::Box::frame(ctx);
 }
 
 } // namespace opennow

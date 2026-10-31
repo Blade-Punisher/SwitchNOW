@@ -10,6 +10,8 @@
 #include "framework/CMemPool.h"
 #include "framework/CShader.h"
 #include "framework/CCmdMemRing.h"
+#include "framework/CCmdMemorySpill.h"
+#include "framework/CDeferredGpuRelease.h"
 #include "nanovg.h"
 
 // Create flags
@@ -172,6 +174,8 @@ namespace nvg {
             /* State. */
             dk::UniqueCmdBuf m_dyn_cmd_buf;
             CCmdMemRing<1> m_dyn_cmd_mem;
+            CCmdMemorySpill<CMemPool::Handle> m_command_spill;
+            static void AddCommandMemory(void* user, DkCmdBuf cmdbuf, size_t minimum);
             std::optional<CMemPool::Handle> m_vertex_buffer;
             CShader m_vertex_shader;
             CShader m_fragment_shader;
@@ -180,6 +184,7 @@ namespace nvg {
 
             u32 m_next_texture_id = 1;
             std::vector<std::shared_ptr<Texture>> m_textures;
+            CDeferredGpuRelease<std::shared_ptr<Texture>> m_retired_textures;
             CDescriptorSet<MaxImages> m_image_descriptor_set;
             CDescriptorSet<SamplerType_Total> m_sampler_descriptor_set;
             std::array<DescriptorOwner, MaxImages> m_image_descriptor_owners;

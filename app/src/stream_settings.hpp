@@ -17,15 +17,20 @@ struct StreamSettings
     std::string codec     = "H264";
     std::string region    = "Auto";
     bool audio_enabled    = true;
-    int audio_volume      = 1200;
+    int audio_volume      = 600;
     int audio_buffer_ms   = 40;
     std::string video_backend = "Auto";
     bool debug_diagnostics = false;
+    bool stats_overlay_enabled = false;
     std::string game_language = "en_US";
     bool persist_game_settings = true;
     std::string controller_layout = "Xbox";
-    std::string image_quality_mode = "Adaptive";
+    std::string image_quality_mode = "Balanced";
     std::string interface_language = "en";
+    bool proxy_enabled = false;
+    std::string proxy_url;
+    std::string proxy_username;
+    std::string proxy_password;
 };
 
 struct GameLanguageOption

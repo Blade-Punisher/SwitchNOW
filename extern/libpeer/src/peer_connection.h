@@ -8,6 +8,9 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+// Retryable SCTP send-window backpressure, distinct from a closed association.
+#define SCTP_SEND_WINDOW_FULL (-2)
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -87,6 +90,9 @@ typedef struct PeerVideoPacket {
 } PeerVideoPacket;
 
 typedef struct PeerVideoRtpStats {
+  // IPv4 live receive telemetry; these are socket operations, not RTP loss.
+  uint64_t receive_batch_calls, receive_batch_datagrams, receive_batch_hits, receive_batch_rejected;
+  int receive_batch_active;
   uint32_t packets_received;
   uint32_t sequence_gaps;
   uint32_t reordered_packets;
@@ -101,7 +107,8 @@ typedef struct PeerVideoRtpStats {
   uint32_t reorder_gap_expirations;
   uint32_t reorder_burst_fast_forwards;
   uint32_t access_units_completed;
-  uint32_t access_units_dropped;
+    uint32_t access_units_dropped;
+    uint32_t last_dropped_timestamp;
   uint32_t nack_requests;
   uint32_t nack_packets_requested;
   uint32_t nack_retries;
@@ -260,6 +267,7 @@ typedef struct PeerNetworkRttStats {
   int stun_current_ms;
   int sctp_current_ms;
   int min_ms;
+  int median_ms;
   int p95_ms;
   int jitter_ms;
   uint32_t stun_sample_age_ms;
@@ -282,6 +290,13 @@ int peer_connection_get_rtt_ms(PeerConnection* pc);
 
 int peer_connection_get_rtt_stats(PeerConnection* pc,
                                   PeerNetworkRttStats* stats);
+// In-memory STUN snapshot only; never queries the usrsctp socket.
+int peer_connection_get_stun_rtt_stats(PeerConnection* pc,
+                                       PeerNetworkRttStats* stats);
+
+void peer_connection_set_diagnostics_enabled(int enabled);
+void peer_connection_set_diagnostics_sink(void (*sink)(const char*, int));
+void peer_connection_flush_diagnostics(void);
 
 #ifdef __cplusplus
 }

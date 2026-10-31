@@ -9,6 +9,7 @@
 #include <deko3d.hpp>
 #include <nanovg/framework/CShader.h>
 
+#include <array>
 #include <optional>
 #include <deque>
 #include <vector>
@@ -29,8 +30,12 @@ private:
     void checkAndInitialize(int width, int height, AVFrame* frame);
     bool updateFrameMapping(AVFrame* frame, uint64_t generation);
     bool updateSoftwareFrame(AVFrame* frame);
-    void bindDescriptors(const dk::ImageDescriptor& luma,
-                         const dk::ImageDescriptor& chroma);
+    void beginUpdateCommands();
+    bool bindDescriptors(const dk::ImageDescriptor& luma,
+                         const dk::ImageDescriptor& chroma,
+                         int luma_texture_id, int chroma_texture_id);
+    bool bindCurrentHardwareTextures();
+    void submitUpdateCommands();
     void releaseSoftwareSlots();
     void retainSubmittedFrame(AVFrame* frame);
 
@@ -49,6 +54,8 @@ private:
     dk::UniqueCmdBuf update_cmd_buf_;
     CMemPool::Handle update_cmd_memory_;
     uint32_t update_cmd_slice_ = 0;
+    uint32_t active_update_cmd_slice_ = 0;
+    std::array<dk::Fence, 8> update_cmd_fences_ {};
     DkCmdList static_cmd_list_ = 0;
     CShader vertex_shader_;
     CShader fragment_shader_;
@@ -69,6 +76,8 @@ private:
         dk::Image chroma;
         dk::ImageDescriptor luma_descriptor;
         dk::ImageDescriptor chroma_descriptor;
+        int luma_texture_id = -1;
+        int chroma_texture_id = -1;
     };
 
     std::vector<FrameMapping> frame_mappings_;
@@ -82,17 +91,31 @@ private:
         dk::Image chroma;
         dk::ImageDescriptor luma_descriptor;
         dk::ImageDescriptor chroma_descriptor;
+        int luma_texture_id = -1, chroma_texture_id = -1;
+        dk::UniqueCmdBuf draw_commands;
+        CMemPool::Handle draw_memory;
+        DkCmdList draw_list = 0;
     };
 
+    bool immutable_software_descriptors_ = false;
     std::optional<CMemPool> image_pool_;
     std::optional<CMemPool> upload_pool_;
     std::vector<SoftwareFrameSlot> software_slots_;
     size_t software_slot_cursor_ = 0;
+    int current_software_slot_ = -1;
+    std::array<dk::Fence, 4> software_slot_fences_ {};
+    std::array<bool, 4> software_slot_submitted_ {};
     int current_mapping_ = -1;
-    int luma_texture_id_ = 0;
-    int chroma_texture_id_ = 0;
+    int luma_texture_id_ = -1;
+    int chroma_texture_id_ = -1;
     uint64_t rendered_generation_ = 0;
-    std::deque<AVFrame*> submitted_frames_;
+    struct SubmittedFrame {
+        AVFrame* frame = nullptr;
+        dk::Fence fence {};
+        bool fence_submitted = false;
+    };
+
+    std::deque<SubmittedFrame> submitted_frames_;
     VideoRenderStats render_stats_ {};
 };
 

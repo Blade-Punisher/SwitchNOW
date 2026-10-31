@@ -2,16 +2,20 @@
 
 #include "gfn_client.hpp"
 #include "models.hpp"
+#include "game_feed_policy.hpp"
+#include "game_feed_focus.hpp"
 
 #include <borealis.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <vector>
 
 namespace opennow
 {
+class GameFeedPager;
 
 class CatalogTab : public brls::Box
 {
@@ -22,7 +26,10 @@ class CatalogTab : public brls::Box
     void willAppear(bool resetState) override;
 
   private:
-    void ReloadCatalog(const std::string& server_query = {});
+    void ReloadCatalog(const std::string& server_query = {}, bool background = false);
+    bool IsFrontmostCatalog();
+    std::string catalog_owner_;
+    std::chrono::steady_clock::time_point last_catalog_sync_ {};
     void BeginSearch();
     bool ClearSearch();
     void UpdateSearchUi();
@@ -32,11 +39,12 @@ class CatalogTab : public brls::Box
     void DetachPagingButton();
     void AttachPagingButton(bool has_more, size_t remaining);
     void HandlePagingButton();
-    void HandlePreviousPage();
+    void GoToPage(size_t page);
     void CycleStoreFilter();
     void CycleSortMode();
     bool OpenGameDialog(brls::View* view, size_t index);
 
+    GameFeedFocus grid_focus_;
     GfnClient client_;
     std::vector<PublicGame> games_;
     std::vector<PublicGame> base_games_;
@@ -48,12 +56,13 @@ class CatalogTab : public brls::Box
     brls::Button* filter_button_               = nullptr;
     brls::Button* sort_button_                 = nullptr;
     brls::Button* more_button_                 = nullptr;
-    brls::Button* previous_page_button_        = nullptr;
-    brls::Button* load_more_button_            = nullptr;
-    brls::Box* paging_container_               = nullptr;
+    GameFeedPager* paging_container_               = nullptr;
     brls::ScrollingFrame* scrolling_frame_     = nullptr;
     brls::Box* list_container_                 = nullptr;
     brls::View* first_card_                    = nullptr;
+    std::shared_ptr<game_feed::Requests> requests_ = std::make_shared<game_feed::Requests>();
+    std::uint64_t feed_revision_ = game_feed::Revision();
+    bool feed_complete_ = false;
     bool loading_                              = false;
     bool rebuilding_                           = false;
     bool load_more_pending_                    = false;

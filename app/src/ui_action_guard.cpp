@@ -1,3 +1,4 @@
+#include "localization.hpp"
 #include "ui_action_guard.hpp"
 
 #include "runtime_journal.hpp"
@@ -71,7 +72,7 @@ bool RunUiAction(const std::string& action, const std::function<void()>& callbac
             "\n\nRuntime: sdmc:/switch/SwitchNOW/runtime.log";
         if (StreamDiagnosticsEnabled())
             detail += "\n\nDetails: sdmc:/switch/SwitchNOW/ui.log";
-        ShowError("Interface Action Failed", detail);
+        ShowError(opennow::Tr("Interface Action Failed"), detail);
     }
     catch (...)
     {
@@ -83,7 +84,7 @@ bool RunUiAction(const std::string& action, const std::function<void()>& callbac
             "\n\nRuntime: sdmc:/switch/SwitchNOW/runtime.log";
         if (StreamDiagnosticsEnabled())
             detail += "\n\nDetails: sdmc:/switch/SwitchNOW/ui.log";
-        ShowError("Interface Action Failed", detail);
+        ShowError(opennow::Tr("Interface Action Failed"), detail);
     }
     // The action was handled even when its body failed. Returning false would
     // let Borealis dispatch the same button press to another action.

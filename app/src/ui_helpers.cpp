@@ -1,4 +1,7 @@
+#include "home_artwork_toast.hpp"
 #include "ui_helpers.hpp"
+#include "session_error_policy.hpp"
+#include "server_assignment_policy.hpp"
 
 #include "ad_playback.hpp"
 #include "ad_break_policy.hpp"
@@ -18,6 +21,7 @@
 #include <mutex>
 #include <sstream>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include "StreamView.hpp"
 
@@ -180,9 +184,11 @@ std::string SessionStatusText(const SessionInfo& info)
     if (info.app_patching)
         return Tr("NVIDIA is updating this game...\nThe session will start automatically when patching finishes.");
 
-    if (info.status == 0)
+    if (info.status == 0 && info.queue_position > 0)
         return TrFormat("In queue... Position: {0}",
                         {std::to_string(info.queue_position)});
+    if (info.status == 0 || (info.seat_setup_step == 1 && info.queue_position <= 0))
+        return Tr("Waiting in queue...");
 
     if (info.status == 1)
     {
@@ -203,7 +209,7 @@ std::string SessionStatusText(const SessionInfo& info)
 
 void ShowDialog(const std::string& title, const std::string& body)
 {
-    auto* dialog = new brls::Dialog(Tr(title) + "\n\n" + Tr(body));
+    auto* dialog = new brls::Dialog(Tr(title) + "\n\n" + TrMessage(body));
     dialog->addButton(Tr("Close"), [] {});
     dialog->setCancelable(true);
     dialog->open();
@@ -211,7 +217,7 @@ void ShowDialog(const std::string& title, const std::string& body)
 
 void ShowModalDialog(const std::string& title, const std::string& body)
 {
-    auto* dialog = new brls::Dialog(Tr(title) + "\n\n" + Tr(body));
+    auto* dialog = new brls::Dialog(Tr(title) + "\n\n" + TrMessage(body));
     dialog->addButton(Tr("Close"), [] {});
     dialog->setCancelable(false);
     dialog->open();
@@ -219,7 +225,7 @@ void ShowModalDialog(const std::string& title, const std::string& body)
 
 void ShowError(const std::string& title, const std::string& body)
 {
-    auto* dialog = new brls::Dialog(Tr(title) + "\n\n" + Tr(body));
+    auto* dialog = new brls::Dialog(Tr(title) + "\n\n" + TrMessage(body));
     dialog->addButton(Tr("Close"), [] {});
     dialog->setCancelable(false);
     dialog->open();
@@ -305,7 +311,7 @@ void LaunchSessionDialog(const GfnClient& client, const AuthSession& auth,
                       "Checking your NVIDIA account",
                       "Validating the saved session before requesting a cloud rig.", 0.08f);
 
-    auto* dialog = new brls::Dialog(box);
+    auto* dialog = new shortcut::ArtworkToastDialog(box);
     dialog->setCancelable(false);
 
     GfnClient bg_client = client;
@@ -364,28 +370,28 @@ void LaunchSessionDialog(const GfnClient& client, const AuthSession& auth,
             });
         };
         try {
-            post_progress(0, "Checking your NVIDIA account",
-                          "Renewing authorization and checking previous sessions.", 0.10f);
+            post_progress(0, opennow::Tr("Checking your NVIDIA account"),
+                          opennow::Tr("Renewing authorization and checking previous sessions."), 0.10f);
             SessionInfo info;
             try {
-                post_progress(1, "Requesting a cloud rig",
-                              "GeForce NOW is allocating hardware for your game.", 0.24f);
+                post_progress(1, opennow::Tr("Requesting a cloud rig"),
+                              opennow::Tr("GeForce NOW is allocating hardware for your game."), 0.24f);
                 info = bg_client.StartSession(bg_auth, bg_app_id, bg_store, bg_internal_title);
             }
             catch (const ReauthenticationRequired&)
             {
-                post_progress(0, "Signing in automatically",
-                              "The saved session expired. Using your remembered NVIDIA account.", 0.14f);
+                post_progress(0, opennow::Tr("Signing in automatically"),
+                              opennow::Tr("The saved session expired. Using your remembered NVIDIA account."), 0.14f);
                 bg_auth = bg_client.ReauthenticateWithSavedCredentials(
                     bg_auth,
                     [post_progress](const std::string& status) {
-                        post_progress(0, "Confirming your NVIDIA account", status, 0.18f);
+                        post_progress(0, opennow::Tr("Confirming your NVIDIA account"), status, 0.18f);
                     },
                     [launch_state]() { return !launch_state->running.load(); });
                 if (!launch_state->running)
                     return;
-                post_progress(1, "Account restored - requesting a rig",
-                              "Quick sign-in completed successfully.", 0.26f);
+                post_progress(1, opennow::Tr("Account restored - requesting a rig"),
+                              opennow::Tr("Quick sign-in completed successfully."), 0.26f);
                 info = bg_client.StartSession(bg_auth, bg_app_id, bg_store, bg_internal_title);
             }
             {
@@ -398,6 +404,7 @@ void LaunchSessionDialog(const GfnClient& client, const AuthSession& auth,
             int app_patching_retries = 0;
             bool ad_break_logged = false;
             std::unordered_set<std::string> completed_ads;
+            ad_report::FailureReports ad_failures;
             HttpClient ad_http_client;
 
             auto apply_ad_report_response = [&info](SessionInfo updated) {
@@ -422,6 +429,10 @@ void LaunchSessionDialog(const GfnClient& client, const AuthSession& auth,
                     updated.requested_region_url = info.requested_region_url;
                 if (updated.assigned_server_id.empty())
                     updated.assigned_server_id = info.assigned_server_id;
+                // Acknowledgements can omit status entirely. Missing queue
+                // data stays unknown until the next full poll, never fake zero.
+                if (updated.status < 0)
+                    updated.status = info.status;
                 info = std::move(updated);
             };
 
@@ -487,8 +498,8 @@ void LaunchSessionDialog(const GfnClient& client, const AuthSession& auth,
                 if (info.status < 0 && ++unknown_status_polls >= 6) {
                     throw std::runtime_error("NVIDIA returned an unknown session status for too long.");
                 }
+                if (info.status >= 0) unknown_status_polls = 0;
                 
-                const float queue_progress = info.status == 0 ? 0.34f : 0.48f;
                 std::string queue_title;
                 std::string queue_detail;
                 const auto ad_state = ad_break::Classify(info.ad_break);
@@ -521,7 +532,8 @@ void LaunchSessionDialog(const GfnClient& client, const AuthSession& auth,
                     constexpr size_t kMaximumAdsPerBreak = 16;
                     size_t ads_played_this_break = 0;
                     bool played_ad = false;
-                    while (ads_played_this_break < kMaximumAdsPerBreak)
+                    while (ads_played_this_break < kMaximumAdsPerBreak &&
+                           info.status != 2 && info.status != 3)
                     {
                         if (!launch_state->running)
                             return;
@@ -533,51 +545,63 @@ void LaunchSessionDialog(const GfnClient& client, const AuthSession& auth,
                             info.ad_break.ads.begin(), info.ad_break.ads.end(),
                             [&](const SessionAdInfo& candidate) {
                                 return !candidate.id.empty() &&
-                                    completed_ads.count(candidate.id) == 0;
+                                    completed_ads.count(candidate.id) == 0 &&
+                                    !ad_failures.Accepted(candidate.id);
                             });
                         if (next_ad == info.ad_break.ads.end())
                             break;
                         const SessionAdInfo ad = *next_ad;
                         const auto* ad_media = ad_break::SelectPreferredMedia(ad);
-                        if (!ad_media || ad_media->url.empty())
-                            throw std::runtime_error(
-                                "NVIDIA requires an advertisement but did not provide playable media.");
-
-                        show_advertisement(true);
                         bool start_reported = false;
-                        auto playback = PlayAdvertisementMedia(
-                            ad, *ad_media, ad_http_client,
-                            ad_playback_state,
-                            [launch_state]() { return !launch_state->running.load(); },
-                            [&]() {
-                                start_reported = report_ad(
-                                    ad_report::Started(ad.id), "start", 3);
-                            });
+                        AdvertisementPlaybackResult playback;
+                        if (!ad_media || ad_media->url.empty())
+                        {
+                            playback.error = "NVIDIA did not provide playable advertisement media";
+                        }
+                        else
+                        {
+                            show_advertisement(true);
+                            playback = PlayAdvertisementMedia(
+                                ad, *ad_media, ad_http_client, ad_playback_state,
+                                [launch_state]() { return !launch_state->running.load(); },
+                                [&]() {
+                                    start_reported = report_ad(
+                                        ad_report::Started(ad.id), "start", 3);
+                                });
+                        }
 
                         if (!playback.completed)
                         {
-                            if (start_reported)
-                            {
-                                try
-                                {
-                                    (void)bg_client.ReportSessionAd(
-                                        bg_auth, info.session_id,
-                                        ad_report::Cancelled(
-                                            ad.id, playback.watched_time_ms,
-                                            playback.cancelled
-                                                ? "user_cancelled"
-                                                : "playback_error"),
-                                        info.server_ip);
-                                }
-                                catch (...) {}
-                            }
                             show_advertisement(false);
                             if (!launch_state->running || playback.cancelled)
+                            {
+                                // User cancellation ends the launch; it is distinct
+                                // from a source/load failure during the queue.
+                                try {
+                                    (void)bg_client.ReportSessionAd(bg_auth, info.session_id,
+                                        ad_report::Cancelled(ad.id, playback.watched_time_ms,
+                                            "user_cancelled"), info.server_ip);
+                                } catch (...) {}
                                 return;
-                            throw std::runtime_error(
-                                playback.error.empty()
-                                    ? "Advertisement playback did not complete."
-                                    : playback.error);
+                            }
+                            LogRuntimeEvent("session", "ad_failure_reporting",
+                                "attempt=" + std::to_string(ad_failures.Attempts(ad.id) + 1) +
+                                " started=" + std::to_string(playback.started ? 1 : 0) +
+                                " watched_ms=" + std::to_string(playback.watched_time_ms) +
+                                " error=" + playback.error);
+                            const bool accepted = ad_failures.Report(ad.id, playback.watched_time_ms,
+                                [&](const SessionAdReport& report) {
+                                    return report_ad(report, "cancel_error", 1);
+                                });
+                            LogRuntimeEvent("session", "ad_failure_resume_polling",
+                                "accepted=" + std::to_string(accepted ? 1 : 0) +
+                                " state=" + std::to_string(info.status) +
+                                " ads_required=" + std::to_string(info.ad_break.required ? 1 : 0));
+                            queue_title = Tr("Preparing your cloud rig");
+                            queue_detail = Tr("Waiting for NVIDIA after an advertisement loading error.");
+                            // Re-poll the existing session; never report Finish
+                            // or create a new session for a failed advertisement.
+                            break;
                         }
 
                         // A Start update can race the first queue transition.
@@ -626,37 +650,38 @@ void LaunchSessionDialog(const GfnClient& client, const AuthSession& auth,
                     show_advertisement(false);
                     if (played_ad)
                         post_progress(
-                            1, "Advertisement complete",
-                            "Returning to cloud rig preparation.", 0.48f);
+                            1, opennow::Tr("Advertisement complete"),
+                            opennow::Tr("Returning to cloud rig preparation."), 0.48f);
                 }
-                else if (ad_state == ad_break::PresentationState::AwaitingMetadata)
-                {
-                    queue_title = Tr("Advertisement required");
-                    queue_detail = Tr("Waiting for NVIDIA to provide the Free-tier advertisement details.");
-                }
-                else if (info.queue_position > 0)
-                {
-                    queue_title = "Position in queue: " + std::to_string(info.queue_position);
-                    queue_detail = info.status == 0
-                        ? "Waiting for an available cloud rig"
-                        : "Preparing your cloud rig";
-                }
-                else if (info.status == 0)
-                {
-                    queue_title = "Waiting in queue...";
-                    queue_detail = "Your cloud rig will start automatically when it is ready.";
-                }
-                else
-                {
-                    queue_title = info.app_patching ? "Updating the game" : "Preparing your cloud rig";
-                    queue_detail = SessionStatusText(info);
-                }
+                // Use the latest server state: an ad report may have changed
+                // the queue position, ad list, or rig readiness above.
+                const auto waiting = ad_break::QueuePresentation(info);
+                queue_title = waiting.show_position
+                    ? "Position in queue: " + std::to_string(info.queue_position)
+                    : waiting.title;
+                queue_detail = waiting.show_position
+                    ? Tr(waiting.detail) : SessionStatusText(info);
+                const bool pending_ad = info.ad_break.required && std::any_of(
+                    info.ad_break.ads.begin(), info.ad_break.ads.end(),
+                    [&](const SessionAdInfo& ad) {
+                        return !ad.id.empty() && completed_ads.count(ad.id) == 0 &&
+                            !ad_failures.Accepted(ad.id);
+                    });
+                if (pending_ad)
+                    queue_detail += "\n" + Tr("Advertisement required");
+                else if (info.ad_break.required && info.ad_break.ads.empty() &&
+                         !ad_failures.HasAccepted())
+                    queue_detail += "\n" + Tr("Waiting for NVIDIA to provide the Free-tier advertisement details.");
+                if (info.server_redirects)
+                    queue_detail += "\n" + Tr("Server reassigned") + ": " + routing::ShortHost(info.server_ip);
                 post_progress(1, queue_title, queue_detail,
-                              ad_state == ad_break::PresentationState::None
-                                  ? queue_progress
-                                  : 0.44f);
+                              info.status == 0 ? 0.34f : 0.48f);
 
-                std::this_thread::sleep_for(std::chrono::seconds(5));
+                if (info.status == 2 || info.status == 3) break;
+                const auto next_poll = std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(ad_break::QueuePollDelayMs(info));
+                while (launch_state->running && std::chrono::steady_clock::now() < next_poll)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 if (!launch_state->running) return;
                 try
                 {
@@ -671,9 +696,9 @@ void LaunchSessionDialog(const GfnClient& client, const AuthSession& auth,
                     unknown_status_polls = 0;
                     post_progress(
                         1,
-                        "Trying another server",
-                        "The fastest region could not keep the cloud session. "
-                        "Retrying through NVIDIA's automatic server routing.",
+                        opennow::Tr("Trying another server"),
+                        opennow::Tr("The fastest region could not keep the cloud session. "
+                        "Retrying through NVIDIA's automatic server routing."),
                         0.30f);
                     info = bg_client.StartSession(
                         bg_auth,
@@ -704,7 +729,7 @@ void LaunchSessionDialog(const GfnClient& client, const AuthSession& auth,
                     unknown_status_polls = 0;
                     post_progress(
                         1,
-                        "Updating the game",
+                        opennow::Tr("Updating the game"),
                         TrFormat(
                             "NVIDIA is patching this title. Waiting before retry {0} of 2.",
                             {std::to_string(app_patching_retries)}),
@@ -736,8 +761,8 @@ void LaunchSessionDialog(const GfnClient& client, const AuthSession& auth,
                 throw std::runtime_error("Session is ready, but NVIDIA did not return a signaling URL.");
             }
 
-            post_progress(2, "Connecting to the streaming server",
-                          "The rig is ready. Configuring the secure network path.", 0.72f);
+            post_progress(2, opennow::Tr("Connecting to the streaming server"),
+                          opennow::Tr("The rig is ready. Configuring the secure network path."), 0.72f);
             brls::sync([=]() {
                 if (!launch_state->running) return;
                 SetLaunchProgress(animation, stage_label, detail_label, 3,
@@ -768,18 +793,20 @@ void LaunchSessionDialog(const GfnClient& client, const AuthSession& auth,
                     info.ice_servers,
                     bg_client,
                     bg_auth,
-                    bg_internal_title)));
+                    bg_internal_title, info.requested_region_url, info.server_ip, false,
+                    info.initial_server_ip, info.server_redirects, info.cloud_client_profile,bg_store)));
             });
 
         } catch (const std::exception& e) {
             show_advertisement(false);
-            std::string err = e.what();
+            const auto presentation = session_error::Present(e.what());
             brls::sync([=]() {
                 if (!launch_state->running) return;
                 animation->SetState(0, 0.04f);
-                stage_label->setText(Tr("Session could not start"));
+                stage_label->setText(Tr(presentation.title));
                 stage_label->setTextColor(nvgRGB(255, 125, 132));
-                detail_label->setText(err + "\n\nPress B to return to the game page.");
+                detail_label->setText(TrMessage(presentation.body) + "\n\n" +
+                                      Tr("Press B to return to the game page."));
                 dialog->setCancelable(true);
             });
         }

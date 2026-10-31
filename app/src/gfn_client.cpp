@@ -1,9 +1,29 @@
 #include "gfn_client.hpp"
+#include "server_probe_policy.hpp"
+#include "network_resource_policy.hpp"
+#include "session_recovery_policy.hpp"
 #include "ad_break_policy.hpp"
 #include "cloud_session_policy.hpp"
+#include "proxy_policy.hpp"
 #include "device_identity.hpp"
 #include "play_history.hpp"
 #include "server_location_policy.hpp"
+#include "server_assignment_policy.hpp"
+#include "routing_diagnostics.hpp"
+#include "gfn/app_launch_mode_policy.hpp"
+#include "gfn/cloud_session_protocol.hpp"
+#include "gfn/session_endpoints.hpp"
+#include "gfn/session_cleanup.hpp"
+#include "gfn/library_catalog.hpp"
+#include "gfn/game_feed_cache.hpp"
+#include "gfn/library_ownership.hpp"
+#include "game_feed_policy.hpp"
+#include "game_feed_models.hpp"
+#include "gfn/server_route_history.hpp"
+#include "gfn/server_zones.hpp"
+#include "server_zone_policy.hpp"
+#include "membership_tier_policy.hpp"
+#include "app_version.hpp"
 
 #ifdef __SWITCH__
 #include <arpa/inet.h>
@@ -24,6 +44,7 @@
 #include "auth_policy.hpp"
 #include "native_auth_policy.hpp"
 #include "runtime_journal.hpp"
+#include "library_metadata_policy.hpp"
 #include "stream_settings.hpp"
 #include "stream_diagnostics.hpp"
 #include <algorithm>
@@ -36,8 +57,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <fstream>
 #include <iterator>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -91,6 +114,7 @@ constexpr std::int64_t kRefreshWindowMs = 10LL * 60LL * 1000LL;
 constexpr std::int64_t kMembershipRefreshIntervalMs = 60LL * 60LL * 1000LL;
 constexpr std::int64_t kMembershipRetryIntervalMs = 5LL * 60LL * 1000LL;
 std::recursive_mutex g_accounts_mutex;
+std::recursive_mutex g_active_cloud_session_mutex;
 std::mutex g_reauthentication_mutex;
 
 struct RegionSelectionCache
@@ -105,12 +129,21 @@ struct RegionSelectionCache
 };
 
 RegionSelectionCache g_region_selection_cache;
-constexpr auto kRegionSelectionCacheLifetime = std::chrono::minutes(30);
+constexpr auto kRegionSelectionCacheLifetime = std::chrono::seconds(60);
 constexpr auto kProviderFallbackCacheLifetime = std::chrono::minutes(5);
 constexpr std::int64_t kPersistentRegionCacheLifetimeMs =
-    60LL * 60LL * 1000LL;
+    60LL * 1000LL;
 constexpr std::int64_t kRegionDisplayCacheLifetimeMs =
     7LL * 24LL * 60LL * 60LL * 1000LL;
+
+bool ZoneCatalogEligible(const AuthSession& session) {
+    return session.provider.code == "NVIDIA" && server_zone::IsOfficialProvider(session.provider.streaming_service_url) &&
+        membership::IsVerifiedFreeTier(session.user.membership_tier, session.user.membership_tier_verified);
+}
+
+void FilterZoneCatalog(std::vector<StreamRegion>& regions, bool eligible) {
+    if (!eligible) std::erase_if(regions, [](const auto& r) { return !r.zone_id.empty(); });
+}
 
 std::string Trim(const std::string& value)
 {
@@ -170,6 +203,35 @@ std::string GetNativeCredentialsPath()
 std::string GetRegionSelectionCachePath()
 {
     return GetAppHome() + "/server_region_cache.json";
+}
+
+void TrackSessionAssignment(SessionInfo& info) {
+    if (info.session_id.empty()) return;
+    static std::mutex assignment_mutex;
+    static std::deque<routing::Assignment> assignments;
+    routing::Assignment snapshot;
+    std::string previous;
+    bool changed;
+    {
+        std::lock_guard<std::mutex> lock(assignment_mutex);
+        auto found = std::find_if(assignments.begin(), assignments.end(), [&](const auto& item) {
+            return item.session_id == info.session_id;
+        });
+        if (found == assignments.end()) {
+            if (assignments.size() >= 8) assignments.pop_front();
+            assignments.emplace_back(); found = std::prev(assignments.end());
+        }
+        previous = found->actual_host;
+        changed = found->Observe(info.session_id, info.requested_region_url, info.server_ip);
+        snapshot = *found;
+    }
+    info.initial_server_ip = snapshot.initial_host;
+    if (!snapshot.requested_url.empty()) info.requested_region_url = snapshot.requested_url;
+    info.server_redirects = snapshot.redirects;
+    if (changed) routing::Event(GetAppHome(), "redirect", {
+        {"requested_host", snapshot.requested_host}, {"initial_host", snapshot.initial_host},
+        {"previous_host", previous}, {"actual_host", snapshot.actual_host},
+        {"changes", std::to_string(snapshot.redirects)}, {"state", std::to_string(info.status)}});
 }
 
 void EnsureAppHome()
@@ -421,30 +483,6 @@ int GetConnectionPort(json_t* connection)
     return ExtractPortFromUrlLike(GetString(connection, "resourcePath"));
 }
 
-std::string BuildSignalingUrlFromConnection(json_t* connection, const std::string& fallback_ip)
-{
-    const std::string resource_path = GetString(connection, "resourcePath");
-    const std::string ip = GetConnectionIp(connection, fallback_ip);
-    int port = GetConnectionPort(connection);
-    if (port <= 0)
-        port = 443;
-
-    if (HasPrefix(resource_path, "wss://"))
-        return resource_path;
-
-    if (HasPrefix(resource_path, "https://"))
-        return "wss://" + resource_path.substr(strlen("https://"));
-
-    if (HasPrefix(resource_path, "rtsps://") || HasPrefix(resource_path, "rtsp://")) {
-        const std::string host = ExtractHostFromUrlLike(resource_path);
-        return host.empty() ? "" : "wss://" + host + "/nvst/";
-    }
-
-    if (!resource_path.empty() && resource_path.front() == '/' && !ip.empty())
-        return "wss://" + ip + ":" + std::to_string(port) + resource_path;
-
-    return ip.empty() ? "" : "wss://" + ip + ":443/nvst/";
-}
 
 void AppendIceServer(SessionInfo& info, std::string url, std::string username, std::string credential)
 {
@@ -543,6 +581,8 @@ void CollectIceServersFromObject(json_t* object, SessionInfo& info)
         CollectIceServerEntry(json_object_get(object, key), info);
 }
 
+void AppendSessionTraceLog(const std::string& line);
+
 void ApplySessionNetworkInfo(json_t* sess, SessionInfo& info)
 {
     if (!sess || !json_is_object(sess))
@@ -563,9 +603,26 @@ void ApplySessionNetworkInfo(json_t* sess, SessionInfo& info)
     if (info.server_ip.empty() && session_control)
         info.server_ip = GetString(session_control, "ip");
 
-    const std::string signaling_url = GetString(sess, "signalingUrl");
-    if (!signaling_url.empty())
-        info.signaling_url = signaling_url;
+    const auto endpoints = gfn::endpoints::Resolve(sess);
+    info.control_ip = endpoints.control_host;
+    info.signaling_url = endpoints.signaling_url;
+    info.signaling_candidates = endpoints.signaling_candidates;
+    if (info.status == 2 || info.status == 3 || info.status == 6)
+        AppendSessionTraceLog("ROUTING event=endpoint_resolution control_host=" + routing::Host(info.control_ip) +
+            " control_source=" + endpoints.control_source +
+            " signaling_route=" + gfn::endpoints::SafeRoute(info.signaling_url) +
+            " signaling_source=" + endpoints.signaling_source +
+            " usage14=" + std::to_string(endpoints.usage14_count) +
+            " usage16=" + std::to_string(endpoints.usage16_count) +
+            " choices=" + std::to_string(endpoints.signaling_candidates.size()) +
+            " profile=" + gfn::cloud_session::ProfileName(info.cloud_client_profile));
+    if (info.status == 2 || info.status == 3 || info.status == 6) {
+        for (const auto& descriptor : endpoints.descriptor_summaries)
+            AppendSessionTraceLog("ROUTING event=signaling_descriptor " + descriptor);
+        for (size_t candidate=0;candidate<endpoints.signaling_candidates.size();++candidate)
+            AppendSessionTraceLog("ROUTING event=signaling_candidate index=" + std::to_string(candidate) +
+                " route=" + gfn::endpoints::SafeRoute(endpoints.signaling_candidates[candidate]));
+    }
 
     json_t* connection_info_array = json_object_get(sess, "connectionInfo");
     if (connection_info_array && json_is_array(connection_info_array)) {
@@ -598,24 +655,7 @@ void ApplySessionNetworkInfo(json_t* sess, SessionInfo& info)
             }
         }
 
-        if (info.signaling_url.empty()) {
-            size_t index;
-            json_t* conn_info;
-            json_array_foreach(connection_info_array, index, conn_info) {
-                CollectIceServersFromObject(conn_info, info);
-
-                if (GetInteger(conn_info, "usage") != 14)
-                    continue;
-
-                info.signaling_url = BuildSignalingUrlFromConnection(conn_info, info.server_ip);
-                if (!info.signaling_url.empty())
-                    break;
-            }
-        }
     }
-
-    if (info.signaling_url.empty() && session_control)
-        info.signaling_url = BuildSignalingUrlFromConnection(session_control, info.server_ip);
 }
 
 std::string EnsureTrailingSlash(std::string value)
@@ -761,6 +801,53 @@ void WriteTextFileAtomically(const std::string& path, const std::string& content
     throw std::runtime_error("Unable to replace " + path);
 }
 
+std::vector<StreamRegion> FetchServerZoneCatalog(const HttpClient& client) {
+    static std::mutex mutex;
+    static std::vector<StreamRegion> cached;
+    static std::chrono::steady_clock::time_point measured {}, retry_after {};
+    std::lock_guard<std::mutex> lock(mutex);
+    const auto now = std::chrono::steady_clock::now();
+    if (now < retry_after) return {};
+    if (!cached.empty() && now - measured < std::chrono::seconds(120)) return cached;
+    HttpResponse queue, mapping;
+    const std::string agent = "SwitchNOW/" + std::string(kAppVersion);
+    auto fetch = [&](const char* url, HttpResponse& response) {
+        try { response = client.Get(url, agent, {"Accept: application/json"}, 3, 4, 512*1024); }
+        catch (...) { response = {}; }
+    };
+    std::thread first([&] { fetch("https://api.printedwaste.com/gfn/queue/", queue); });
+    std::thread second([&] { fetch("https://remote.printedwaste.com/config/GFN_SERVERID_TO_REGION_MAPPING", mapping); });
+    first.join(); second.join();
+    gfn::ZoneCatalogDiagnostics diagnostics;
+    cached = queue.status_code == 200 && mapping.status_code == 200
+        ? gfn::ParseServerZones(queue.body, mapping.body, NowMs(), &diagnostics) : std::vector<StreamRegion> {};
+    measured = std::chrono::steady_clock::now();
+    if (cached.empty()) retry_after = measured + std::chrono::seconds(30);
+    const auto fresh = std::count_if(cached.begin(), cached.end(), [](const auto& r) {
+        return server_zone::FreshQueue(r, NowMs());
+    });
+    routing::Event(GetAppHome(), "zone_catalog", {{"zones", std::to_string(cached.size())},
+        {"fresh_queue_estimates", std::to_string(fresh)}, {"queue_http", std::to_string(queue.status_code)},
+        {"mapping_http", std::to_string(mapping.status_code)},
+        {"queue_stale", std::to_string(diagnostics.stale)}, {"queue_future", std::to_string(diagnostics.future)},
+        {"queue_invalid", std::to_string(diagnostics.invalid)}, {"queue_newest_age_ms", std::to_string(diagnostics.newest_age_ms)},
+        {"queue_rule", "fresh_only_unknown_is_not_zero"}, {"fallback", cached.empty() ? "regional_catalog" : "none"}});
+    return cached;
+}
+
+void ApplyRouteHistory(std::vector<StreamRegion>& regions, const std::string& provider) {
+    const auto rows = server_route::ParseHistory(ReadTextFile(GetAppHome() + "/server_route_history.json"));
+    const auto normalized = server_location::NormalizeStreamingBaseUrl(provider);
+    for (auto& region : regions) {
+        const auto estimate = server_route::Predict(rows, normalized, region.url, region.ping_ms, NowMs());
+        region.route_history_penalty_ms = estimate.penalty_ms;
+        region.route_history_samples = estimate.samples;
+        region.route_history_redirects = estimate.redirects;
+        region.route_history_expected_rtt_ms = estimate.expected_rtt_ms;
+        region.route_history_at_ms = estimate.newest_ms;
+    }
+}
+
 struct PersistedRegionSelection
 {
     bool valid = false;
@@ -773,7 +860,7 @@ struct PersistedRegionSelection
 
 PersistedRegionSelection LoadPersistentRegionSelection(
     const std::string& expected_provider_url,
-    std::int64_t maximum_age_ms)
+    std::int64_t maximum_age_ms, bool zones_allowed = false)
 {
     PersistedRegionSelection cache;
     const std::string body = ReadTextFile(GetRegionSelectionCachePath());
@@ -783,8 +870,11 @@ PersistedRegionSelection LoadPersistentRegionSelection(
     try
     {
         JsonPtr root = LoadJson(body);
-        if (GetInteger(root.get(), "schema") != 1)
+        const int schema = GetInteger(root.get(), "schema");
+        // R29 recalculates old winners; their score used unverified route history.
+        if (schema != 5 && schema != 6 && schema != 7 && schema != 8)
             return cache;
+        if (schema < 8 && maximum_age_ms <= kPersistentRegionCacheLifetimeMs) return cache;
 
         cache.provider_url = server_location::NormalizeStreamingBaseUrl(
             GetString(root.get(), "provider_url"));
@@ -800,13 +890,10 @@ PersistedRegionSelection LoadPersistentRegionSelection(
 
         const std::string normalized_provider =
             server_location::NormalizeStreamingBaseUrl(expected_provider_url);
-        const std::int64_t age_ms = std::max<std::int64_t>(
-            0, NowMs() - cache.measured_at_ms);
         if (cache.provider_url.empty() ||
             cache.provider_url != normalized_provider ||
             cache.selected_url.empty() ||
-            cache.measured_at_ms <= 0 ||
-            age_ms > maximum_age_ms)
+            !server_location::IsProbeFresh(cache.measured_at_ms, NowMs(), maximum_age_ms))
         {
             return {};
         }
@@ -830,12 +917,40 @@ PersistedRegionSelection LoadPersistentRegionSelection(
                     GetInteger(entry, "successful_probes", 0);
                 region.attempted_probes =
                     GetInteger(entry, "attempted_probes", 0);
+                region.probe_degraded = json_is_true(json_object_get(entry, "probe_degraded"));
+                region.observed_stream_rtt_ms =
+                    schema >= 2 ? GetInteger(entry, "observed_stream_rtt_ms", -1) : -1;
+                if (schema >= 3) {
+                    region.observed_stream_p95_ms = GetInteger(entry, "observed_stream_p95_ms", -1);
+                    region.observed_transport_pause_count = GetInteger(entry, "observed_transport_pause_count", 0);
+                    region.observed_transport_pause_ms = GetInteger(entry, "observed_transport_pause_ms", 0);
+                    region.observed_playback_pause_count = GetInteger(entry, "observed_playback_pause_count", 0);
+                    region.observed_playback_pause_ms = GetInteger(entry, "observed_playback_pause_ms", 0);
+                    region.observed_session_seconds = GetInteger(entry, "observed_session_seconds", 0);
+                    json_t* observed_at = json_object_get(entry, "observed_at_ms");
+                    if (json_is_integer(observed_at))
+                        region.observed_at_ms = json_integer_value(observed_at);
+                }
+                region.observed_server_host = GetString(entry, "observed_server_host");
+                region.observed_media_endpoint = GetString(entry, "observed_media_endpoint");
+                region.zone_id = GetString(entry, "zone_id");
+                region.zone_queue_estimate = GetInteger(entry, "zone_queue_estimate", -1);
+                if (auto* time = json_object_get(entry, "zone_queue_at_ms"); json_is_integer(time))
+                    region.zone_queue_at_ms = json_integer_value(time);
+                if (auto* time = json_object_get(entry, "zone_catalog_at_ms"); json_is_integer(time))
+                    region.zone_catalog_at_ms = json_integer_value(time);
                 if (!region.name.empty() && !region.url.empty())
                     cache.regions.push_back(std::move(region));
             }
         }
 
-        cache.valid = true;
+        FilterZoneCatalog(cache.regions, zones_allowed);
+        ApplyRouteHistory(cache.regions, cache.provider_url);
+        cache.selected_url = server_zone::Select(cache.regions, LoadStreamSettings().region, NowMs());
+        for (const auto& region : cache.regions)
+            if (server_location::NormalizeStreamingBaseUrl(region.url) == cache.selected_url)
+                cache.selected_name = region.name;
+        cache.valid = !cache.selected_url.empty();
     }
     catch (...)
     {
@@ -848,18 +963,20 @@ void SavePersistentRegionSelection(
     const std::string& provider_url,
     const std::string& selected_url,
     const std::string& selected_name,
-    const std::vector<StreamRegion>& regions)
+    const std::vector<StreamRegion>& regions,
+    std::int64_t measured_at_ms = 0)
 {
     JsonPtr root(json_object(), &json_decref);
     JsonPtr entries(json_array(), &json_decref);
-    json_object_set_new(root.get(), "schema", json_integer(1));
+    json_object_set_new(root.get(), "schema", json_integer(8));
     json_object_set_new(
         root.get(), "provider_url", json_string(provider_url.c_str()));
     json_object_set_new(
         root.get(), "selected_url", json_string(selected_url.c_str()));
     json_object_set_new(
         root.get(), "selected_name", json_string(selected_name.c_str()));
-    json_object_set_new(root.get(), "measured_at_ms", json_integer(NowMs()));
+    json_object_set_new(root.get(), "measured_at_ms",
+        json_integer(measured_at_ms > 0 ? measured_at_ms : NowMs()));
 
     for (const StreamRegion& region : regions)
     {
@@ -877,6 +994,28 @@ void SavePersistentRegionSelection(
         json_object_set_new(
             entry.get(), "attempted_probes",
             json_integer(region.attempted_probes));
+        json_object_set_new(entry.get(), "probe_degraded", json_boolean(region.probe_degraded));
+        json_object_set_new(entry.get(), "observed_stream_rtt_ms",
+                            json_integer(region.observed_stream_rtt_ms));
+        json_object_set_new(entry.get(), "observed_stream_p95_ms",
+                            json_integer(region.observed_stream_p95_ms));
+        json_object_set_new(entry.get(), "observed_transport_pause_count",
+                            json_integer(region.observed_transport_pause_count));
+        json_object_set_new(entry.get(), "observed_transport_pause_ms",
+                            json_integer(region.observed_transport_pause_ms));
+        json_object_set_new(entry.get(), "observed_playback_pause_count",
+                            json_integer(region.observed_playback_pause_count));
+        json_object_set_new(entry.get(), "observed_playback_pause_ms",
+                            json_integer(region.observed_playback_pause_ms));
+        json_object_set_new(entry.get(), "observed_session_seconds",
+                            json_integer(region.observed_session_seconds));
+        json_object_set_new(entry.get(), "observed_at_ms", json_integer(region.observed_at_ms));
+        json_object_set_new(entry.get(), "observed_server_host", json_string(region.observed_server_host.c_str()));
+        json_object_set_new(entry.get(), "observed_media_endpoint", json_string(region.observed_media_endpoint.c_str()));
+        json_object_set_new(entry.get(), "zone_id", json_string(region.zone_id.c_str()));
+        json_object_set_new(entry.get(), "zone_queue_estimate", json_integer(region.zone_queue_estimate));
+        json_object_set_new(entry.get(), "zone_queue_at_ms", json_integer(region.zone_queue_at_ms));
+        json_object_set_new(entry.get(), "zone_catalog_at_ms", json_integer(region.zone_catalog_at_ms));
         json_array_append_new(entries.get(), json_incref(entry.get()));
     }
     json_object_set_new(root.get(), "regions", json_incref(entries.get()));
@@ -1146,37 +1285,11 @@ bool IsDeviceSessionLimitResponse(json_t* root)
 
 std::string GetSessionServerIp(json_t* session)
 {
-    if (!session || !json_is_object(session))
-        return {};
-
-    json_t* connections = json_object_get(session, "connectionInfo");
-    if (json_is_array(connections))
-    {
-        size_t index = 0;
-        json_t* connection = nullptr;
-        json_array_foreach(connections, index, connection)
-        {
-            if (GetInteger(connection, "usage") != 14)
-                continue;
-
-            const std::string ip = GetConnectionIp(connection);
-            if (!ip.empty())
-                return ip;
-        }
-    }
-
-    return GetString(json_object_get(session, "sessionControlInfo"), "ip");
-}
-
-void ApplySeatSetupInfo(json_t* sess, SessionInfo& info)
-{
-    json_t* seat_setup = sess ? json_object_get(sess, "seatSetupInfo") : nullptr;
-    if (!seat_setup || !json_is_object(seat_setup))
-        return;
-
-    json_t* queue_position = json_object_get(seat_setup, "queuePosition");
-    if (queue_position && json_is_integer(queue_position))
-        info.queue_position = json_integer_value(queue_position);
+    // List responses may contain placeholder hosts or incomplete IP arrays.
+    // Use the same validated selection as ordinary session polling.
+    const auto host=gfn::endpoints::Resolve(session).control_host;
+    if(host.empty()) routing::Event(GetAppHome(),"cleanup_hint",{{"result","unusable_or_missing"}});
+    return host;
 }
 
 void ApplySessionAds(json_t* sess, SessionInfo& info)
@@ -1525,17 +1638,42 @@ std::vector<int> MeasureRegionLatencySamples(
     const HttpClient& http_client,
     const std::string& url,
     int probe_count,
-    long timeout_ms)
+    long timeout_ms, const char* phase, std::chrono::steady_clock::time_point deadline,
+    int& attempted)
 {
     std::vector<int> samples;
+    std::ostringstream outcomes;
+    std::ostringstream codes, dns, tls, os_errors, ips;
+    std::string detail;
     samples.reserve(static_cast<size_t>(std::max(0, probe_count)));
+    const int previous_attempts = attempted;
     for (int attempt = 0; attempt < probe_count; ++attempt)
     {
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now()).count();
+        if (remaining <= 0) break;
+        if (!network::ProbeAllowed()) break;
+        TcpProbeDiagnostics diagnostics;
         const int ping_ms =
-            http_client.MeasureTcpHandshakeLatencyMs(url, timeout_ms);
+            http_client.MeasureTcpHandshakeLatencyMs(url, std::min<long>(timeout_ms, remaining), &diagnostics);
+        if (diagnostics.suppressed) break;
+        ++attempted;
         if (ping_ms >= 0)
             samples.push_back(ping_ms);
+        if (attempt) { outcomes << ';'; codes << ';'; dns << ';'; tls << ';'; os_errors << ';'; ips << ';'; }
+        outcomes << ping_ms;
+        codes << diagnostics.curl_code; dns << diagnostics.dns_ms; tls << diagnostics.tls_ms;
+        os_errors << diagnostics.os_error; ips << diagnostics.remote_ip;
+        if (!diagnostics.detail.empty()) detail = diagnostics.detail;
+        if (diagnostics.resource_exhausted) break;
+        if (attempt + 1 < probe_count)
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
     }
+    routing::Event(GetAppHome(), "probe", {{"phase", phase}, {"host", routing::Host(url)},
+        {"timeout_ms", std::to_string(timeout_ms)}, {"outcomes_ms", outcomes.str()},
+        {"curl_codes", codes.str()}, {"os_errors", os_errors.str()}, {"remote_ips", ips.str()},
+        {"detail", detail}, {"kind", "TCP_only_no_TLS"}, {"dns_ms", dns.str()}, {"tls_ms", tls.str()},
+        {"successful", std::to_string(samples.size())}, {"attempted", std::to_string(attempted - previous_attempts)}});
     return samples;
 }
 
@@ -1611,6 +1749,8 @@ class NativeAuthHttpSession
         const std::vector<std::string>& headers = {},
         const std::string& body = {})
     {
+        auto cancellation = HttpCancellationScope::Callback();
+        if (cancellation && cancellation()) throw std::runtime_error("Session recovery cancelled");
         const std::string safe_url = SanitizeRuntimeUrl(url);
         const auto operation_id = BeginRuntimeOperation(
             "auth_transport", method, "url=" + safe_url + " connection=reused");
@@ -1631,6 +1771,15 @@ class NativeAuthHttpSession
         curl_easy_setopt(curl_.get(), CURLOPT_FOLLOWLOCATION, 0L);
         curl_easy_setopt(curl_.get(), CURLOPT_CONNECTTIMEOUT, 10L);
         curl_easy_setopt(curl_.get(), CURLOPT_TIMEOUT, 30L);
+        curl_easy_setopt(curl_.get(), CURLOPT_NOSIGNAL, 1L);
+        if (cancellation) {
+            curl_easy_setopt(curl_.get(), CURLOPT_NOPROGRESS, 0L);
+            curl_easy_setopt(curl_.get(), CURLOPT_XFERINFODATA, &cancellation);
+            curl_easy_setopt(curl_.get(), CURLOPT_XFERINFOFUNCTION,
+                +[](void* context, curl_off_t, curl_off_t, curl_off_t, curl_off_t) -> int {
+                    return (*static_cast<std::function<bool()>*>(context))() ? 1 : 0;
+                });
+        }
         curl_easy_setopt(curl_.get(), CURLOPT_ACCEPT_ENCODING, "");
         curl_easy_setopt(curl_.get(), CURLOPT_SSL_VERIFYPEER, 1L);
         curl_easy_setopt(curl_.get(), CURLOPT_SSL_VERIFYHOST, 2L);
@@ -2453,7 +2602,7 @@ std::string OptimizeImageUrl(const std::string& url, int width = 544)
 
 bool IsOwnedLibraryStatus(const std::string& status)
 {
-    return status == "MANUAL" || status == "PLATFORM_SYNC" || status == "IN_LIBRARY";
+    return gfn::library::OwnedStatus(status);
 }
 
 bool IsNumericId(const std::string& value)
@@ -3170,5 +3319,6 @@ std::string BuildSteamImageUrl(const std::string& steam_url)
 #include "gfn/auth.inc"
 #include "gfn/library.inc"
 #include "gfn/session.inc"
+#include "gfn/session_recovery.inc"
 
 } // namespace opennow

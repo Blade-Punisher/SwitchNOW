@@ -1,5 +1,7 @@
 #pragma once
 
+#include <algorithm>
+#include <cctype>
 #include <string>
 #include <string_view>
 
@@ -23,6 +25,26 @@ inline bool HasScheme(std::string_view value)
             return false;
     }
     return true;
+}
+
+inline bool DownloadAdvertisementFile(std::string_view url, std::string_view profile)
+{
+    std::string address(url);
+    std::string kind(profile);
+    const auto lower = [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); };
+    std::transform(address.begin(), address.end(), address.begin(), lower);
+    std::transform(kind.begin(), kind.end(), kind.begin(), lower);
+    if (address.rfind("https://", 0) != 0 && address.rfind("http://", 0) != 0)
+        return false;
+    // Signed CDN paths often have no extension and use the profile "default".
+    // Keep explicit playlists on their existing streaming path; never treat
+    // an HLS manifest as a standalone video file.
+    const auto end = address.find_first_of("?#");
+    const std::string path = address.substr(0, end);
+    const bool playlist = kind.find("hls") != std::string::npos ||
+        path.find(".m3u8") != std::string::npos || path.find(".mpd") != std::string::npos ||
+        kind.find("dash") != std::string::npos;
+    return !playlist;
 }
 
 inline std::string FfmpegLocalFileUrl(std::string_view path)

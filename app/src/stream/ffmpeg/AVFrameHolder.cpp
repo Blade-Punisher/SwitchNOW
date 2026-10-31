@@ -6,6 +6,7 @@
 //
 
 #include "AVFrameHolder.hpp"
+#include "stream/DecodeQueuePolicy.hpp"
 #include "VideoFrameTiming.hpp"
 
 #include "borealis.hpp"
@@ -18,32 +19,42 @@ AVFrameQueue::~AVFrameQueue() {
     cleanup();
 }
 
-namespace
-{
-
-AVFrame* referenceFrame(const AVFrame* source)
-{
-    if (!source)
-        return nullptr;
-    return av_frame_clone(source);
+size_t AVFrameQueue::discardFrom(uint32_t timestamp) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    size_t removed=0;
+    // Only not-yet-selected pictures are removed. Keep the displayed buffer
+    // and its references alive so recovery can repeat the last good picture.
+    for(size_t i=queue.size();i>0;--i) {
+        const auto index=i-1;
+        if(queue[index]->pts==AV_NOPTS_VALUE || opennow::video::RtpDelta(
+                static_cast<uint32_t>(queue[index]->pts),timestamp)>=0) {
+            headers_.Recycle(queue[index]);
+            queue.erase(queue.begin()+index);
+            generations.erase(generations.begin()+index);
+            pushedAt.erase(pushedAt.begin()+index);
+            ++removed;
+        }
+    }
+    framesDroppedStat+=removed;
+    return removed;
 }
 
-} // namespace
-
 void AVFrameQueue::push(const AVFrame* item) {
-    AVFrame* copy = referenceFrame(item);
-    if (!copy) {
-        brls::Logger::warning("Frame queue: failed to copy decoded frame");
-        return;
-    }
-
     {
         std::lock_guard<std::mutex> lock(m_mutex);
+        AVFrame* copy = headers_.Reference(item);
+        if (!copy) {
+            brls::Logger::warning("Frame queue: failed to reference decoded frame");
+            return;
+        }
         const auto now = std::chrono::steady_clock::now();
         if (lastPushAt.time_since_epoch().count() != 0) {
             const int64_t interval_us =
                 std::chrono::duration_cast<std::chrono::microseconds>(
                     now - lastPushAt).count();
+            if (interval_us > 35000)
+                if (ready_latency_.Protect(static_cast<uint64_t>(std::chrono::duration_cast<
+                    std::chrono::microseconds>(now.time_since_epoch()).count()))) ++ready_metrics_.latency_backoffs;
             // Ignore pauses and duplicate burst completions. The EWMA follows
             // real 30/60 FPS cadence without reacting to a single late frame.
             if (interval_us >= 5000 && interval_us <= 50000) {
@@ -62,6 +73,7 @@ void AVFrameQueue::push(const AVFrame* item) {
             }
         }
         lastPushAt = now;
+        consecutiveWaitTimeouts = 0;
         if (item->pts != AV_NOPTS_VALUE) {
             const uint32_t timestamp = static_cast<uint32_t>(item->pts);
             if (hasLastPushedRtpTimestamp) {
@@ -82,15 +94,19 @@ void AVFrameQueue::push(const AVFrame* item) {
         }
         queue.push_back(copy);
         generations.push_back(++nextGeneration);
+        pushedAt.push_back(now);
         framesCopiedStat++;
 
         if (queue.size() > limit) {
             AVFrame* dropped = queue.front();
             queue.pop_front();
             generations.pop_front();
-            av_frame_free(&dropped);
+            pushedAt.pop_front();
+            headers_.Recycle(dropped);
             framesDroppedStat++;
             overflowDroppedStat++;
+            if (ready_latency_.Protect(static_cast<uint64_t>(std::chrono::duration_cast<
+                std::chrono::microseconds>(now.time_since_epoch()).count()))) ++ready_metrics_.latency_backoffs;
         }
     }
     m_frame_available.notify_one();
@@ -119,31 +135,18 @@ AVFrame* AVFrameQueue::pop(bool& reused, uint64_t& generation, int64_t target_pt
 
     if (queue.empty() && bufferFrame != nullptr &&
         emptyWaitBudget.count() > 0) {
-        auto predicted_wait = emptyWaitBudget;
-        if (observedProducerIntervalUs > 0 &&
-            lastPushAt.time_since_epoch().count() != 0) {
-            const int64_t elapsed_us =
-                std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now() - lastPushAt).count();
-            const int64_t until_expected_us =
-                observedProducerIntervalUs - elapsed_us;
-            const int64_t cap_us = emptyWaitBudget.count();
-            const int64_t jitter_guard_us = std::clamp<int64_t>(
-                observedProducerJitterUs * 2 + 500, 750, 3000);
-
-            // Wait only when the next decoded frame is expected near the
-            // current presentation deadline. The measured deviation adds a
-            // bounded guard for bursty server output. A real source pause is
-            // still reused immediately instead of blocking every UI frame.
-            if (until_expected_us < -cap_us || until_expected_us > cap_us) {
-                predicted_wait = std::chrono::microseconds(0);
-                predictiveWaitSkippedStat++;
-            } else {
-                predicted_wait = std::chrono::microseconds(
-                    std::clamp<int64_t>(
-                        until_expected_us + jitter_guard_us, 750, cap_us));
-            }
-        }
+        const auto elapsed_us = lastPushAt.time_since_epoch().count() == 0 ? 0 :
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - lastPushAt).count();
+        // Decoded frames arriving in bursts bias wall-clock intervals upward.
+        // RTP cadence remains the better predictor while it is in normal range.
+        const int64_t cadence_us = observedProducerRtpTicks >= 450 && observedProducerRtpTicks <= 4500
+            ? static_cast<int64_t>(observedProducerRtpTicks) * 1000000 / 90000
+            : observedProducerIntervalUs;
+        const auto predicted_wait = std::chrono::microseconds(opennow::video::PredictFrameWaitUs(
+            emptyWaitBudget.count(), consecutiveWaitTimeouts, cadence_us,
+            observedProducerJitterUs, elapsed_us));
+        if (!predicted_wait.count()) predictiveWaitSkippedStat++;
 
         if (predicted_wait.count() > 0) {
             briefWaitStat++;
@@ -159,10 +162,31 @@ AVFrame* AVFrameQueue::pop(bool& reused, uint64_t& generation, int64_t target_pt
             briefWaitMaximumUs = std::max(briefWaitMaximumUs, waited_us);
             if (recovered) {
                 briefWaitRecoveredStat++;
+                consecutiveWaitTimeouts = 0;
             } else {
                 briefWaitTimeoutStat++;
+                ++consecutiveWaitTimeouts;
             }
         }
+    }
+
+    // Preserve normal FIFO delivery. Only discard a frame that has become very
+    // old during a render/decode stall when a newer decoded frame is ready.
+    // This prevents a multi-frame catch-up burst without recreating R4's
+    // aggressive RTP-span dropping.
+    const auto presentation_now = std::chrono::steady_clock::now();
+    while (queue.size() > 1 && !pushedAt.empty() &&
+           presentation_now - pushedAt.front() >=
+               std::chrono::milliseconds(opennow::video::MaximumReadyFrameAgeMs())) {
+        AVFrame* dropped = queue.front();
+        queue.pop_front();
+        generations.pop_front();
+        pushedAt.pop_front();
+        headers_.Recycle(dropped);
+        framesDroppedStat++;
+        staleAgeDroppedStat++;
+        if (ready_latency_.Protect(static_cast<uint64_t>(std::chrono::duration_cast<
+            std::chrono::microseconds>(presentation_now.time_since_epoch()).count()))) ++ready_metrics_.latency_backoffs;
     }
 
     const bool external_clock_present = target_pts != AV_NOPTS_VALUE;
@@ -193,6 +217,8 @@ AVFrame* AVFrameQueue::pop(bool& reused, uint64_t& generation, int64_t target_pt
             if (decision == opennow::video::FrameDecision::HoldPrevious) {
                 fakeFrameUsedStat++;
                 timingHoldStat++;
+                if (ready_latency_.Protect(static_cast<uint64_t>(std::chrono::duration_cast<
+                    std::chrono::microseconds>(presentation_now.time_since_epoch()).count()))) ++ready_metrics_.latency_backoffs;
                 currentConsecutiveReuse++;
                 maximumConsecutiveReuse =
                     std::max(maximumConsecutiveReuse, currentConsecutiveReuse);
@@ -205,7 +231,8 @@ AVFrame* AVFrameQueue::pop(bool& reused, uint64_t& generation, int64_t target_pt
             AVFrame* dropped = queue.front();
             queue.pop_front();
             generations.pop_front();
-            av_frame_free(&dropped);
+            pushedAt.pop_front();
+            headers_.Recycle(dropped);
             framesDroppedStat++;
             timingDroppedStat++;
         }
@@ -216,15 +243,48 @@ AVFrame* AVFrameQueue::pop(bool& reused, uint64_t& generation, int64_t target_pt
         lastPacingPhaseTicks = 0;
     }
 
+    const auto now_us = static_cast<uint64_t>(std::chrono::duration_cast<
+        std::chrono::microseconds>(presentation_now.time_since_epoch()).count());
+    if (!queue.empty() && presentationStarted && !pushedAt.empty()) {
+        const auto age = [&](size_t i) {
+            return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                presentation_now - pushedAt[i]).count());
+        };
+        const bool next = queue.size() > 1 && queue[0]->pts != AV_NOPTS_VALUE &&
+            queue[1]->pts != AV_NOPTS_VALUE;
+        const int32_t step = next ? opennow::video::RtpDelta(
+            static_cast<uint32_t>(queue[1]->pts), static_cast<uint32_t>(queue[0]->pts)) : 0;
+        const int64_t period = static_cast<int64_t>(observedProducerRtpTicks) * 1000000 / 90000;
+        if (ready_latency_.Consider(now_us, period, observedProducerJitterUs,
+                observedProducerIntervalUs, queue.size(), age(0), next ? age(1) : 0,
+                step, external_clock_present)) {
+            auto* dropped = queue.front();
+            queue.pop_front(); generations.pop_front(); pushedAt.pop_front();
+            headers_.Recycle(dropped);
+            ++framesDroppedStat;
+            ++ready_metrics_.latency_trims;
+        }
+    }
+
     if (!queue.empty()) {
         if (bufferFrame)
-            av_frame_free(&bufferFrame);
+            headers_.Recycle(bufferFrame);
 
+        const auto selected_depth = static_cast<unsigned>(queue.size());
         AVFrame* item = queue.front();
         queue.pop_front();
         bufferGeneration = generations.front();
         generations.pop_front();
+        bufferPushedAt = pushedAt.front();
+        pushedAt.pop_front();
         bufferFrame = item;
+        const uint64_t age_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - bufferPushedAt).count());
+        ready_metrics_.Observe(age_us, selected_depth);
+        presentationAgeCount++;
+        presentationAgeTotalUs += age_us;
+        presentationAgeMaximumUs = std::max(presentationAgeMaximumUs, age_us);
         presentationStarted = true;
         if (external_clock_present)
             sourceClockPresentStat++;
@@ -234,6 +294,7 @@ AVFrame* AVFrameQueue::pop(bool& reused, uint64_t& generation, int64_t target_pt
         reused = false;
     } else {
         fakeFrameUsedStat++;
+        if (ready_latency_.Protect(now_us)) ++ready_metrics_.latency_backoffs;
         queueEmptyReuseStat++;
         currentConsecutiveReuse++;
         maximumConsecutiveReuse =
@@ -243,6 +304,16 @@ AVFrame* AVFrameQueue::pop(bool& reused, uint64_t& generation, int64_t target_pt
 
     generation = bufferGeneration;
     return bufferFrame;
+}
+
+opennow::video::ReadyFrameMetrics AVFrameQueue::readyMetrics() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return ready_metrics_;
+}
+
+QueueFrameHeaders::Stats AVFrameQueue::headerStats() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return headers_.GetStats();
 }
 
 size_t AVFrameQueue::size() const {
@@ -268,6 +339,11 @@ size_t AVFrameQueue::getTimingDropStat() const {
 size_t AVFrameQueue::getOverflowDropStat() const {
     std::lock_guard<std::mutex> lock(m_mutex);
     return overflowDroppedStat;
+}
+
+size_t AVFrameQueue::getStaleAgeDropStat() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return staleAgeDroppedStat;
 }
 
 size_t AVFrameQueue::getTimingHoldStat() const {
@@ -360,23 +436,44 @@ size_t AVFrameQueue::getClockBypassPresentStat() const {
     return clockBypassPresentStat;
 }
 
+uint64_t AVFrameQueue::getPresentationAgeCount() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return presentationAgeCount;
+}
+
+uint64_t AVFrameQueue::getPresentationAgeTotalUs() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return presentationAgeTotalUs;
+}
+
+uint64_t AVFrameQueue::getPresentationAgeMaximumUs() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return presentationAgeMaximumUs;
+}
+
 void AVFrameQueue::cleanup() {
     std::lock_guard<std::mutex> lock(m_mutex);
     while (!queue.empty()) {
         AVFrame* frame = queue.front();
         queue.pop_front();
-        av_frame_free(&frame);
+        headers_.Recycle(frame);
     }
     while (!generations.empty())
         generations.pop_front();
+    while (!pushedAt.empty())
+        pushedAt.pop_front();
 
     if (bufferFrame)
-        av_frame_free(&bufferFrame);
+        headers_.Recycle(bufferFrame);
 
+    headers_.Clear();
+    ready_metrics_ = {};
+    ready_latency_ = {};
     fakeFrameUsedStat = 0;
     framesDroppedStat = 0;
     timingDroppedStat = 0;
     overflowDroppedStat = 0;
+    staleAgeDroppedStat = 0;
     timingHoldStat = 0;
     queueEmptyReuseStat = 0;
     briefWaitStat = 0;
@@ -403,4 +500,8 @@ void AVFrameQueue::cleanup() {
     maximumConsecutiveReuse = 0;
     sourceClockPresentStat = 0;
     clockBypassPresentStat = 0;
+    bufferPushedAt = {};
+    presentationAgeCount = 0;
+    presentationAgeTotalUs = 0;
+    presentationAgeMaximumUs = 0;
 }

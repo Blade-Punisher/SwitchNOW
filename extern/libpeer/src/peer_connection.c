@@ -1,4 +1,7 @@
 #include <inttypes.h>
+#include <errno.h>
+#include "dtls_datagram_queue.h"
+#include "udp_receive_batch.h"
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,12 +28,52 @@
     }                                                                 \
   }
 
+static int peer_connection_diagnostics_enabled = 0;
+static void (*peer_connection_diagnostics_sink)(const char*, int) = NULL;
+static FILE* peer_diag_file = NULL;
+static FILE* peer_diag_trace = NULL;
+static FILE* peer_diag_input = NULL;
+
+static void peer_connection_close_diagnostics(void) {
+  if (peer_diag_file) fclose(peer_diag_file);
+  if (peer_diag_trace) fclose(peer_diag_trace);
+  if (peer_diag_input) fclose(peer_diag_input);
+  peer_diag_file = NULL;
+  peer_diag_trace = NULL;
+  peer_diag_input = NULL;
+}
+
+void peer_connection_flush_diagnostics(void) {
+  if (peer_diag_file) fflush(peer_diag_file);
+  if (peer_diag_trace) fflush(peer_diag_trace);
+  if (peer_diag_input) fflush(peer_diag_input);
+  sctp_flush_diagnostics();
+}
+
+void peer_connection_set_diagnostics_enabled(int enabled) {
+  peer_connection_diagnostics_enabled = enabled != 0;
+  sctp_set_diagnostics_enabled(enabled);
+  if (!peer_connection_diagnostics_enabled)
+    peer_connection_close_diagnostics();
+}
+
+void peer_connection_set_diagnostics_sink(void (*sink)(const char*, int)) {
+  peer_connection_diagnostics_sink = sink;
+  sctp_set_diagnostics_sink(sink);
+  if (sink) peer_connection_close_diagnostics();
+}
+
 struct PeerConnection {
   PeerConfiguration config;
   PeerConnectionState state;
   Agent agent;
   DtlsSrtp dtls_srtp;
   Sctp sctp;
+  DtlsDatagramQueue dtls_output;
+  int dtls_output_failed;
+  unsigned dtls_output_high_water;
+  uint32_t dtls_output_max_wait_ms;
+  uint32_t dtls_output_deferred;
 
   char sdp[CONFIG_SDP_BUFFER_SIZE];
 
@@ -86,12 +129,36 @@ static int peer_connection_send_rtcp_nack(PeerConnection* pc, uint32_t ssrc,
 static void peer_connection_maybe_send_video_nack(PeerConnection* pc);
 
 static void peer_connection_diag_log(const char* fmt, ...) {
-  FILE* file = fopen("sdmc:/switch/OpenNOWSwitch/signaling.log", "a");
-  FILE* trace = fopen("sdmc:/switch/OpenNOWSwitch/stream_trace.log", "a");
+  if (!peer_connection_diagnostics_enabled)
+    return;
+
+  if (peer_connection_diagnostics_sink) {
+    char line[1024];
+    char message[960];
+    const int input_relevant = strstr(fmt, "sctp") != NULL ||
+                               strstr(fmt, "dtls") != NULL ||
+                               strstr(fmt, "transport_completed") != NULL;
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(message, sizeof(message), fmt, args);
+    va_end(args);
+    snprintf(line, sizeof(line), "LIBPEER %s", message);
+    peer_connection_diagnostics_sink(line, input_relevant);
+    return;
+  }
+
+  if (!peer_diag_file)
+    peer_diag_file = fopen("sdmc:/switch/SwitchNOW/signaling.log", "a");
+  if (!peer_diag_trace)
+    peer_diag_trace = fopen("sdmc:/switch/SwitchNOW/stream_trace.log", "a");
+  FILE* file = peer_diag_file;
+  FILE* trace = peer_diag_trace;
   const int input_relevant = strstr(fmt, "sctp") != NULL ||
                              strstr(fmt, "dtls") != NULL ||
                              strstr(fmt, "transport_completed") != NULL;
-  FILE* input = input_relevant ? fopen("sdmc:/switch/OpenNOWSwitch/input.log", "a") : NULL;
+  if (input_relevant && !peer_diag_input)
+    peer_diag_input = fopen("sdmc:/switch/SwitchNOW/input.log", "a");
+  FILE* input = input_relevant ? peer_diag_input : NULL;
 
   if (file) {
     fputs("LIBPEER ", file);
@@ -124,15 +191,12 @@ static void peer_connection_diag_log(const char* fmt, ...) {
 
   if (file) {
     fputc('\n', file);
-    fclose(file);
   }
   if (trace) {
     fputc('\n', trace);
-    fclose(trace);
   }
   if (input) {
     fputc('\n', input);
-    fclose(input);
   }
 }
 
@@ -166,16 +230,20 @@ static int peer_connection_dtls_srtp_recv(void* ctx, unsigned char* buf, size_t 
   PeerConnection* pc = (PeerConnection*)dtls_srtp->user_data;
 
   if (pc->agent_ret > 0 && pc->agent_ret <= len) {
-    memcpy(buf, pc->agent_buf, pc->agent_ret);
-    return pc->agent_ret;
+    const int received = pc->agent_ret;
+    memcpy(buf, pc->agent_buf, received);
+    pc->agent_ret = 0;
+    return received;
   }
 
-  // DTLS is advanced by peer_connection_loop(). Blocking here starves that
-  // loop, so a missing datagram must be reported as "try again", not -1.
-  const int ret = agent_recv(&pc->agent, buf, len);
-  if (ret > 0)
-    return ret;
-
+  // During the handshake MbedTLS drives the receive path itself. Once media
+  // is live, peer_connection_loop() owns socket reads and an absent datagram
+  // must not start another poll while the peer lock is held.
+  if (pc->state != PEER_CONNECTION_COMPLETED) {
+    const int received = agent_recv(&pc->agent, buf, len);
+    if (received > 0)
+      return received;
+  }
   return MBEDTLS_ERR_SSL_WANT_READ;
 }
 
@@ -183,8 +251,23 @@ static int peer_connection_dtls_srtp_send(void* ctx, const uint8_t* buf, size_t 
   DtlsSrtp* dtls_srtp = (DtlsSrtp*)ctx;
   PeerConnection* pc = (PeerConnection*)dtls_srtp->user_data;
 
-  // LOGD("send %.4x %.4x, %ld", *(uint16_t*)buf, *(uint16_t*)(buf + 2), len);
-  return agent_send(&pc->agent, buf, len);
+  if (!pc->dtls_output.count) {
+    const uint32_t begin_ms = ports_get_epoch_time();
+    const int sent = agent_send(&pc->agent, buf, len);
+    const uint32_t elapsed_ms = ports_get_epoch_time() - begin_ms;
+    if (elapsed_ms >= 8) peer_connection_diag_log("DTLS wire_send_ms=%u bytes=%zu", elapsed_ms, len);
+    if (sent >= 0) return sent;
+    if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) { pc->dtls_output_failed = 1; return sent; }
+  }
+  const int queued = dtls_queue_push(&pc->dtls_output, buf, len, ports_get_epoch_time());
+  if (queued < 0) {
+    pc->dtls_output_failed = 1;
+    return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+  }
+  ++pc->dtls_output_deferred;
+  if (pc->dtls_output.count > pc->dtls_output_high_water)
+    pc->dtls_output_high_water = pc->dtls_output.count;
+  return queued;
 }
 
 static void peer_connection_incoming_rtcp(PeerConnection* pc, uint8_t* buf, size_t len) {
@@ -309,6 +392,8 @@ PeerConnection* peer_connection_create(PeerConfiguration* config) {
 
 void peer_connection_destroy(PeerConnection* pc) {
   if (pc) {
+    peer_connection_diag_log("dtls_output deferred=%u highWater=%u maxWaitMs=%u",
+      pc->dtls_output_deferred, pc->dtls_output_high_water, pc->dtls_output_max_wait_ms);
     rtp_decoder_cleanup(&pc->artp_decoder);
     rtp_decoder_cleanup(&pc->vrtp_decoder);
     sctp_destroy_association(&pc->sctp);
@@ -429,6 +514,37 @@ static int peer_connection_loop_internal(PeerConnection* pc,
                                          int completed_poll_timeout_ms) {
   uint32_t ssrc = 0;
   int packet_processed = 0;
+  if (pc->state == PEER_CONNECTION_CLOSED || pc->state == PEER_CONNECTION_FAILED) return 0;
+  if (pc->dtls_output.count && !pc->agent.nominated_pair) {
+    pc->dtls_output_failed = 1;
+    pc->dtls_output.count = 0;
+  }
+  // Drain accepted encrypted records in order, without holding the worker in
+  // a writable-socket wait. Never feed a newer record ahead of a deferred one.
+  for (unsigned sent = 0; sent < 4 && pc->dtls_output.count; ++sent) {
+    DtlsQueuedDatagram* record = &pc->dtls_output.records[pc->dtls_output.head];
+    const uint32_t age = ports_get_epoch_time() - record->queued_ms;
+    if (age > pc->dtls_output_max_wait_ms) pc->dtls_output_max_wait_ms = age;
+    if (age > 2000) { pc->dtls_output_failed = 1; break; }
+    if (agent_send(&pc->agent, record->data, record->size) < 0) {
+      if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+        pc->dtls_output_failed = 1;
+      break;
+    }
+    dtls_queue_pop(&pc->dtls_output);
+  }
+  if (pc->dtls_output_failed) {
+    peer_connection_diag_log("dtls_output_failed queued=%u maxWaitMs=%u", pc->dtls_output.count, pc->dtls_output_max_wait_ms);
+    STATE_CHANGED(pc, PEER_CONNECTION_FAILED);
+    return 0;
+  }
+  if (pc->state == PEER_CONNECTION_COMPLETED) {
+    const uint32_t phase_ms = ports_get_epoch_time();
+    sctp_retransmit_pending(&pc->sctp);
+    const uint32_t elapsed_ms = ports_get_epoch_time() - phase_ms;
+    if (elapsed_ms >= 8)
+      peer_connection_diag_log("slow_phase=sctp_retransmit elapsedMs=%u", elapsed_ms);
+  }
   memset(pc->agent_buf, 0, sizeof(pc->agent_buf));
   pc->agent_ret = -1;
 
@@ -483,12 +599,21 @@ static int peer_connection_loop_internal(PeerConnection* pc,
         }
 
         peer_connection_diag_log("transport_completed");
+        const int receive_batch = udp_socket_enable_receive_batch(&pc->agent.udp_sockets[0]);
+#if CONFIG_IPV6
+        (void)udp_socket_enable_receive_batch(&pc->agent.udp_sockets[1]);
+#endif
+        peer_connection_diag_log("udp_receive mode=%s capacity=%u noWait=1 fallback=recvfrom",
+                                 receive_batch ? "recvmmsg" : "recvfrom",
+                                 receive_batch ? UDP_RECEIVE_BATCH_CAPACITY : 1u);
         STATE_CHANGED(pc, PEER_CONNECTION_COMPLETED);
       } else if ((uint32_t)(ports_get_epoch_time() - pc->dtls_handshake_started_ms) >= 3500) {
         int failed_pairs = agent_fail_nominated_remote(&pc->agent);
         peer_connection_diag_log("dtls_endpoint_timeout attempts=%d failedPairs=%d; trying next remote",
                                  pc->dtls_handshake_attempts,
                                  failed_pairs);
+        pc->dtls_output.count = 0;
+        pc->dtls_output.head = 0;
         dtls_srtp_reset_session(&pc->dtls_srtp);
         pc->dtls_handshake_attempts = 0;
         pc->dtls_handshake_started_ms = 0;
@@ -504,9 +629,18 @@ static int peer_connection_loop_internal(PeerConnection* pc,
       }
       break;
     case PEER_CONNECTION_COMPLETED:
-      if ((pc->agent_ret = agent_recv_timeout(&pc->agent, pc->agent_buf,
+      {
+      const uint32_t recv_started_ms = ports_get_epoch_time();
+      pc->agent_ret = agent_recv_timeout(&pc->agent, pc->agent_buf,
                                               sizeof(pc->agent_buf),
-                                              completed_poll_timeout_ms)) > 0) {
+                                              completed_poll_timeout_ms);
+      const uint32_t recv_elapsed_ms = ports_get_epoch_time() - recv_started_ms;
+      if (recv_elapsed_ms >= 8)
+        peer_connection_diag_log("slow_phase=udp_recv elapsedMs=%u timeoutMs=%d selectMs=%u readMs=%u stunMs=%u",
+                                 recv_elapsed_ms, completed_poll_timeout_ms,
+                                 pc->agent.recv_select_ms, pc->agent.recv_read_ms, pc->agent.recv_stun_ms);
+      }
+      if (pc->agent_ret > 0) {
         packet_processed = 1;
         LOGD("agent_recv %d", pc->agent_ret);
         pc->completed_udp_packets++;
@@ -521,7 +655,11 @@ static int peer_connection_loop_internal(PeerConnection* pc,
                                      pc->agent_ret,
                                      preview);
           }
+          const uint32_t dtls_started_ms = ports_get_epoch_time();
           int ret = dtls_srtp_read(&pc->dtls_srtp, pc->temp_buf, sizeof(pc->temp_buf));
+          const uint32_t dtls_elapsed_ms = ports_get_epoch_time() - dtls_started_ms;
+          if (dtls_elapsed_ms >= 8)
+            peer_connection_diag_log("slow_phase=dtls_read elapsedMs=%u", dtls_elapsed_ms);
           LOGD("Got DTLS data %d", ret);
 
           if (ret > 0) {
@@ -534,7 +672,11 @@ static int peer_connection_loop_internal(PeerConnection* pc,
                                        pc->sctp_read_events,
                                        sctp_preview);
             }
+            const uint32_t sctp_started_ms = ports_get_epoch_time();
             sctp_incoming_data(&pc->sctp, (char*)pc->temp_buf, ret);
+            const uint32_t sctp_elapsed_ms = ports_get_epoch_time() - sctp_started_ms;
+            if (sctp_elapsed_ms >= 8)
+              peer_connection_diag_log("slow_phase=sctp_incoming elapsedMs=%u", sctp_elapsed_ms);
           } else if (ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
             peer_connection_diag_log("dtls_peer_close_notify packets=%d sctpConnected=%d",
                                      pc->completed_dtls_packets,
@@ -568,14 +710,19 @@ static int peer_connection_loop_internal(PeerConnection* pc,
           LOGD("Got RTP packet");
           pc->completed_rtp_packets++;
 
-          if (pc->completed_rtp_packets <= 10 || pc->completed_rtp_packets % 1200 == 0) {
+          if (pc->completed_rtp_packets <= 10 || pc->completed_rtp_packets % 6000 == 0) {
             peer_connection_diag_log("udp_class=rtp count=%d bytes=%d preview=%s",
                                      pc->completed_rtp_packets,
                                      pc->agent_ret,
                                      preview);
           }
 
-          if (dtls_srtp_decrypt_rtp_packet(&pc->dtls_srtp, pc->agent_buf, &pc->agent_ret) != 0) {
+          const uint32_t decrypt_started_ms = ports_get_epoch_time();
+          const int decrypt_ret = dtls_srtp_decrypt_rtp_packet(&pc->dtls_srtp, pc->agent_buf, &pc->agent_ret);
+          const uint32_t decrypt_elapsed_ms = ports_get_epoch_time() - decrypt_started_ms;
+          if (decrypt_elapsed_ms >= 8)
+            peer_connection_diag_log("slow_phase=rtp_decrypt elapsedMs=%u", decrypt_elapsed_ms);
+          if (decrypt_ret != 0) {
             pc->rtp_decrypt_failures++;
             peer_connection_diag_log("rtp_decrypt_failed failures=%d bytesAfter=%d",
                                      pc->rtp_decrypt_failures,
@@ -603,6 +750,7 @@ static int peer_connection_loop_internal(PeerConnection* pc,
                                        rtp->header.type == PT_PCMA ||
                                        rtp->header.type == PT_OPUS ||
                                        rtp->header.type == 63;
+          const uint32_t dispatch_started_ms = ports_get_epoch_time();
           if (ssrc == pc->remote_assrc || (pc->remote_assrc == 0 && is_audio_payload)) {
             if (pc->remote_assrc == 0) {
               pc->remote_assrc = ssrc;
@@ -669,8 +817,10 @@ static int peer_connection_loop_internal(PeerConnection* pc,
                   pc->vrtp_decoder.access_units_dropped);
             }
           }
-          peer_connection_maybe_send_video_nack(pc);
-
+          const uint32_t dispatch_elapsed_ms = ports_get_epoch_time() - dispatch_started_ms;
+          if (dispatch_elapsed_ms >= 8)
+            peer_connection_diag_log("slow_phase=rtp_dispatch elapsedMs=%u class=%s",
+                                     dispatch_elapsed_ms, is_audio_payload ? "audio" : "video");
         } else {
           pc->completed_unknown_packets++;
           if (pc->completed_unknown_packets <= 10 || pc->completed_unknown_packets % 600 == 0) {
@@ -688,6 +838,14 @@ static int peer_connection_loop_internal(PeerConnection* pc,
         }
       }
 
+      {
+        const uint32_t maintenance_started_ms = ports_get_epoch_time();
+        rtp_decoder_poll(&pc->vrtp_decoder);
+        peer_connection_maybe_send_video_nack(pc);
+        const uint32_t maintenance_elapsed_ms = ports_get_epoch_time() - maintenance_started_ms;
+        if (maintenance_elapsed_ms >= 8)
+          peer_connection_diag_log("slow_phase=rtp_maintenance elapsedMs=%u", maintenance_elapsed_ms);
+      }
       agent_rtt_probe_tick(&pc->agent);
 
       if (CONFIG_KEEPALIVE_TIMEOUT > 0 &&
@@ -1138,10 +1296,9 @@ int peer_connection_get_rtt_ms(PeerConnection* pc) {
              : -1;
 }
 
-int peer_connection_get_rtt_stats(PeerConnection* pc,
+int peer_connection_get_stun_rtt_stats(PeerConnection* pc,
                                   PeerNetworkRttStats* stats) {
   AgentRttStats stun_stats;
-  int sctp_rtt_ms;
   if (!pc || !stats) {
     return -1;
   }
@@ -1151,15 +1308,15 @@ int peer_connection_get_rtt_stats(PeerConnection* pc,
   stats->stun_current_ms = -1;
   stats->sctp_current_ms = -1;
   stats->min_ms = -1;
+  stats->median_ms = -1;
   stats->p95_ms = -1;
   stats->jitter_ms = -1;
   stats->source = PEER_RTT_SOURCE_NONE;
 
   agent_get_rtt_stats(&pc->agent, &stun_stats);
-  sctp_rtt_ms = sctp_get_rtt_ms(&pc->sctp);
   stats->stun_current_ms = stun_stats.current_ms;
-  stats->sctp_current_ms = sctp_rtt_ms;
   stats->min_ms = stun_stats.min_ms;
+  stats->median_ms = stun_stats.median_ms;
   stats->p95_ms = stun_stats.p95_ms;
   stats->jitter_ms = stun_stats.jitter_ms;
   stats->stun_sample_age_ms = stun_stats.sample_age_ms;
@@ -1169,17 +1326,29 @@ int peer_connection_get_rtt_stats(PeerConnection* pc,
   stats->probes_lost = stun_stats.probes_lost;
   stats->probes_unmatched = stun_stats.probes_unmatched;
   stats->probe_in_flight = stun_stats.probe_in_flight;
+  if (stun_stats.current_ms >= 0) {
+    stats->current_ms = stun_stats.current_ms;
+    stats->source = PEER_RTT_SOURCE_STUN;
+  }
+  return 0;
+}
+
+int peer_connection_get_rtt_stats(PeerConnection* pc,
+                                  PeerNetworkRttStats* stats) {
+  if (peer_connection_get_stun_rtt_stats(pc, stats) != 0) return -1;
+  const int sctp_rtt_ms = sctp_get_rtt_ms(&pc->sctp);
+  stats->sctp_current_ms = sctp_rtt_ms;
 
   // A recent matched STUN response measures the selected media path directly.
   // If probes are delayed or lost, SCTP SRTT keeps the displayed value live.
-  if (stun_stats.current_ms >= 0 && stun_stats.sample_age_ms <= 1500) {
-    stats->current_ms = stun_stats.current_ms;
+  if (stats->stun_current_ms >= 0 && stats->stun_sample_age_ms <= 1500) {
+    stats->current_ms = stats->stun_current_ms;
     stats->source = PEER_RTT_SOURCE_STUN;
   } else if (sctp_rtt_ms >= 0) {
     stats->current_ms = sctp_rtt_ms;
     stats->source = PEER_RTT_SOURCE_SCTP;
-  } else if (stun_stats.current_ms >= 0) {
-    stats->current_ms = stun_stats.current_ms;
+  } else if (stats->stun_current_ms >= 0) {
+    stats->current_ms = stats->stun_current_ms;
     stats->source = PEER_RTT_SOURCE_STUN;
   }
   return 0;
@@ -1236,11 +1405,18 @@ int peer_connection_get_video_rtp_stats(PeerConnection* pc, PeerVideoRtpStats* s
       pc->vrtp_decoder.reorder_burst_fast_forwards;
   stats->access_units_completed = pc->vrtp_decoder.access_units_completed;
   stats->access_units_dropped = pc->vrtp_decoder.access_units_dropped;
+  stats->last_dropped_timestamp = pc->vrtp_decoder.last_dropped_timestamp;
   stats->nack_requests = pc->video_nack_requests;
   stats->nack_packets_requested = pc->video_nack_packets_requested;
   stats->nack_retries = pc->video_nack_retries;
   stats->rtx_packets_received = pc->video_rtx_packets_received;
   stats->rtx_packets_recovered = pc->video_rtx_packets_recovered;
   stats->rtx_packets_invalid = pc->video_rtx_packets_invalid;
+  const UdpReceiveBatch* batch = pc->agent.udp_sockets[0].receive_batch;
+  stats->receive_batch_active = batch && !batch->unsupported;
+  stats->receive_batch_calls = batch ? batch->calls : 0;
+  stats->receive_batch_datagrams = batch ? batch->datagrams : 0;
+  stats->receive_batch_hits = batch ? batch->cache_hits : 0;
+  stats->receive_batch_rejected = batch ? batch->rejected : 0;
   return 0;
 }

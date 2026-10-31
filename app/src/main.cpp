@@ -1,3 +1,4 @@
+#include "ui_localization.hpp"
 #ifdef __SWITCH__
 #include <switch.h>
 #include <sys/stat.h>
@@ -17,13 +18,16 @@
 
 #include "main_activity.hpp"
 #include "app_version.hpp"
+#include "connection_debug.hpp"
 #include "app_paths.hpp"
 #include "cover_image_cache.hpp"
 #include "home_shortcut.hpp"
+#include "shortcut_worker.hpp"
 #include "localization.hpp"
 #include "runtime_journal.hpp"
 #include "stream_diagnostics.hpp"
 #include "stream_settings.hpp"
+#include "proxy_diagnostics.hpp"
 #include "ui_helpers.hpp"
 #include "update_service.hpp"
 
@@ -81,133 +85,18 @@ void ShowStartupFailure(const std::string& message)
 } // namespace
 #endif
 
-namespace
-{
-
-class ShortcutResultView final : public brls::Box
-{
-  public:
-    ShortcutResultView(
-        opennow::shortcut::InstallerResult result,
-        std::function<void()> continue_to_application)
-        : brls::Box(brls::Axis::COLUMN)
-        , continue_to_application_(std::move(continue_to_application))
-    {
-        setGrow(1.0f);
-        setAlignItems(brls::AlignItems::CENTER);
-        setJustifyContent(brls::JustifyContent::CENTER);
-        setBackgroundColor(nvgRGB(10, 12, 15));
-
-        auto* card = new brls::Box(brls::Axis::COLUMN);
-        card->setWidth(690);
-        card->setPadding(34, 42, 34, 42);
-        card->setAlignItems(brls::AlignItems::CENTER);
-        card->setBackgroundColor(nvgRGB(22, 25, 30));
-        card->setCornerRadius(18);
-
-        auto* eyebrow = new brls::Label();
-        eyebrow->setText("SwitchNOW");
-        eyebrow->setFontSize(14);
-        eyebrow->setTextColor(nvgRGB(77, 218, 130));
-        eyebrow->setHorizontalAlign(brls::HorizontalAlign::CENTER);
-        eyebrow->setMarginBottom(14);
-        card->addView(eyebrow);
-
-        const std::string shortcut_title = result.title.empty()
-            ? opennow::Tr("Game shortcut")
-            : result.title;
-        auto* heading = new brls::Label();
-        heading->setText(result.success
-                ? opennow::Tr("HOME shortcut created")
-                : opennow::Tr("HOME shortcut installation failed"));
-        heading->setFontSize(29);
-        heading->setTextColor(result.success
-                ? nvgRGB(242, 246, 248)
-                : nvgRGB(255, 132, 132));
-        heading->setHorizontalAlign(brls::HorizontalAlign::CENTER);
-        heading->setMarginBottom(18);
-        card->addView(heading);
-
-        auto* message = new brls::Label();
-        message->setWidth(600);
-        message->setText(result.success
-                ? opennow::TrFormat(
-                      "The shortcut for {0} was created successfully and added to the HOME Menu.",
-                      {shortcut_title})
-                : (result.error.empty()
-                          ? opennow::Tr("HOME shortcut installation failed.")
-                          : result.error));
-        message->setFontSize(20);
-        message->setTextColor(nvgRGB(188, 195, 204));
-        message->setHorizontalAlign(brls::HorizontalAlign::CENTER);
-        message->setMarginBottom(28);
-        card->addView(message);
-
-        close_button_ = new brls::Button();
-        close_button_->setStyle(&brls::BUTTONSTYLE_BORDERED);
-        close_button_->setWidth(600);
-        close_button_->setText(opennow::Tr("Close"));
-        close_button_->registerClickAction([this](brls::View*) {
-            if (continued_)
-                return true;
-            continued_ = true;
-            opennow::LogRuntimeEvent(
-                "shortcut", "result_screen_close", "continue_to_application");
-            auto continuation =
-                std::make_shared<std::function<void()>>(
-                    std::move(continue_to_application_));
-            if (!brls::Application::popActivity(
-                    brls::TransitionAnimation::FADE,
-                    [continuation]() mutable {
-                        // Borealis invokes the pop callback before deleting the
-                        // old activity and unblocking input. Build the main UI
-                        // on the next UI cycle, after teardown is complete.
-                        brls::sync([continuation]() mutable {
-                            if (*continuation)
-                            {
-                                auto callback = std::move(*continuation);
-                                callback();
-                            }
-                        });
-                    }))
-            {
-                continued_ = false;
-                continue_to_application_ = std::move(*continuation);
-            }
-            return true;
-        });
-        card->addView(close_button_);
-        card->setLastFocusedView(close_button_);
-        addView(card);
-        setLastFocusedView(close_button_);
-
-        opennow::LogRuntimeEvent(
-            "shortcut", "result_screen_open",
-            result.success ? "success title=" + shortcut_title
-                           : "failed error=" + result.error);
-    }
-
-    brls::View* getDefaultFocus() override
-    {
-        return close_button_;
-    }
-
-  private:
-    brls::Button* close_button_ = nullptr;
-    std::function<void()> continue_to_application_;
-    bool continued_ = false;
-};
-
-} // namespace
-
 int main(int argc, char* argv[])
 {
     opennow::PrepareAppStorage();
-    if (argc > 0 && argv && argv[0])
+    if (argc > 0 && argv && argv[0]) {
         opennow::shortcut::SetExecutablePath(argv[0]);
+        opennow::update::SetExecutablePath(argv[0]);
+    }
     auto launch_request = opennow::shortcut::ReadLaunchRequest(argc, argv);
     auto installer_result = opennow::shortcut::ConsumeInstallerResult();
     opennow::InitializeRuntimeJournal(opennow::kAppVersion);
+    opennow::proxy_diagnostics::Configuration(opennow::LoadStreamSettings());
+    opennow::connection_debug::Initialize(opennow::AppHomePath(),opennow::kAppVersion);
     const auto shortcut_repair =
         opennow::shortcut::RepairLegacyShortcutManifests();
     opennow::LogRuntimeEvent(
@@ -234,9 +123,12 @@ int main(int argc, char* argv[])
         }
 
         AppendBootLog("boot: curl_global_init ok");
+        opennow::connection_debug::Event(0,"curl_initialized");
         if (const curl_version_info_data* version =
                 curl_version_info(CURLVERSION_NOW))
         {
+            opennow::connection_debug::Event(0,"curl_backend",{{"curl",version->version ? version->version : "unknown"},
+                {"tls",version->ssl_version ? version->ssl_version : "unknown"}});
             opennow::LogRuntimeEvent(
                 "tls", "backend",
                 "curl=" +
@@ -274,54 +166,21 @@ int main(int argc, char* argv[])
                 ? "extended=enabled runtime=always_on"
                 : "extended=disabled runtime=always_on");
 
-        auto launch_request_holder =
-            std::make_shared<std::optional<opennow::shortcut::LaunchRequest>>(
-                std::move(launch_request));
-        auto open_main_activity = [launch_request_holder]() mutable {
-            std::optional<opennow::shortcut::LaunchRequest> request;
-            if (*launch_request_holder)
-                request = std::move(**launch_request_holder);
-            launch_request_holder->reset();
-            AppendBootLog("boot: pushing main activity");
-            brls::Application::pushActivity(
-                new opennow::MainActivity(std::move(request)),
-                brls::TransitionAnimation::FADE);
-            AppendBootLog("boot: main activity pushed");
-        };
-
-        if (installer_result)
-        {
-            // Borealis deliberately refuses to pop the first activity. Keep an
-            // inert root below the installer result so Close can remove the
-            // result screen before constructing the network-backed main UI.
-            auto* bootstrap_root = new brls::Box(brls::Axis::COLUMN);
-            bootstrap_root->setGrow(1.0f);
-            bootstrap_root->setBackgroundColor(nvgRGB(10, 12, 15));
-            brls::Application::pushActivity(
-                new brls::Activity(bootstrap_root),
-                brls::TransitionAnimation::NONE);
-            AppendBootLog("boot: shortcut bootstrap activity pushed");
-
-            AppendBootLog("boot: pushing shortcut result activity");
-            brls::Application::pushActivity(
-                new brls::Activity(new ShortcutResultView(
-                    std::move(*installer_result), open_main_activity)),
-                brls::TransitionAnimation::NONE);
-            AppendBootLog("boot: shortcut result activity pushed");
-        }
-        else
-        {
-            open_main_activity();
-        }
+        brls::Application::pushActivity(new opennow::MainActivity(
+            std::move(launch_request), std::move(installer_result)),
+            brls::TransitionAnimation::FADE);
         opennow::update::ConfirmInstalledUpdate();
         while (brls::Application::mainLoop())
         {
+            opennow::LocalizeActionHints();
         }
 
         AppendBootLog("boot: main loop exited");
+        opennow::shortcut::ShutdownWorker();
         opennow::ShutdownImageCache();
         opennow::ShutdownRuntimeJournal();
         curl_global_cleanup();
+        opennow::connection_debug::Shutdown();
         return EXIT_SUCCESS;
     }
     catch (const std::exception& ex)
@@ -335,8 +194,10 @@ int main(int argc, char* argv[])
         ShowStartupFailure("Unhandled non-standard exception");
     }
 
+    opennow::shortcut::ShutdownWorker();
     opennow::ShutdownImageCache();
     opennow::ShutdownRuntimeJournal();
     curl_global_cleanup();
+    opennow::connection_debug::Shutdown();
     return EXIT_FAILURE;
 }

@@ -729,6 +729,8 @@ AuthSession GfnClient::EnsureFreshSavedSession(const AuthSession& session) const
     for (const AuthSession& saved : LoadAccountsFromDisk(nullptr))
     {
         if (saved.user.user_id == session.user.user_id &&
+            saved.provider.idp_id == session.provider.idp_id &&
+            saved.provider.streaming_service_url == session.provider.streaming_service_url &&
             (saved.last_refresh_at_ms > source.last_refresh_at_ms ||
              saved.tokens.expires_at_ms > source.tokens.expires_at_ms))
         {
@@ -774,6 +776,8 @@ AuthSession GfnClient::ForceRefreshSavedSession(const AuthSession& session) cons
     for (const AuthSession& saved : LoadAccountsFromDisk(nullptr))
     {
         if (saved.user.user_id == session.user.user_id &&
+            saved.provider.idp_id == session.provider.idp_id &&
+            saved.provider.streaming_service_url == session.provider.streaming_service_url &&
             (saved.last_refresh_at_ms > source.last_refresh_at_ms ||
              saved.tokens.expires_at_ms > source.tokens.expires_at_ms))
         {
@@ -967,8 +971,11 @@ void RememberActiveCloudSession(
     const AuthSession& auth,
     const std::string& session_id,
     const std::string& launch_app_id,
-    const std::string& streaming_base_url)
+    const std::string& streaming_base_url,
+    const std::string& device_id,
+    const std::string& client_id, gfn::cloud_session::ClientProfile profile)
 {
+    std::lock_guard<std::recursive_mutex> lock(g_active_cloud_session_mutex);
     if (session_id.empty())
         return;
 
@@ -976,7 +983,9 @@ void RememberActiveCloudSession(
     {
         JsonPtr root(json_object(), &json_decref);
         json_object_set_new(root.get(), "session_id", json_string(session_id.c_str()));
-        json_object_set_new(root.get(), "user_id", json_string(auth.user.user_id.c_str()));
+        gfn::cloud_session::StoreRoutingIdentity(root.get(),
+            {auth.user.user_id, auth.provider.idp_id, auth.provider.streaming_service_url, device_id, client_id});
+        gfn::cloud_session::StoreClientProfile(root.get(),profile);
         json_object_set_new(root.get(), "launch_app_id", json_string(launch_app_id.c_str()));
         json_object_set_new(
             root.get(),
@@ -991,10 +1000,25 @@ void RememberActiveCloudSession(
     }
 }
 
+gfn::cloud_session::ClientProfile LoadActiveCloudSessionProfile(
+    const AuthSession& auth, const std::string& session_id) {
+    std::lock_guard<std::recursive_mutex> lock(g_active_cloud_session_mutex);
+    const auto body=ReadTextFile(GetActiveCloudSessionPath());
+    if(body.empty()) return gfn::cloud_session::NewClientProfile(auth.provider.code);
+    JsonPtr root(nullptr,&json_decref);
+    try { root=LoadJson(body); } catch (...) { return gfn::cloud_session::NewClientProfile(auth.provider.code); }
+    if(GetString(root.get(),"session_id")!=session_id || GetString(root.get(),"user_id")!=auth.user.user_id ||
+        GetString(root.get(),"provider_id")!=auth.provider.idp_id ||
+        GetString(root.get(),"provider_url")!=auth.provider.streaming_service_url)
+        return gfn::cloud_session::NewClientProfile(auth.provider.code);
+    return gfn::cloud_session::ReadClientProfile(root.get());
+}
+
 std::string LoadActiveCloudSessionBaseUrl(
     const AuthSession& auth,
     const std::string& session_id)
 {
+    std::lock_guard<std::recursive_mutex> lock(g_active_cloud_session_mutex);
     const std::string body = ReadTextFile(GetActiveCloudSessionPath());
     if (body.empty())
         return "";
@@ -1019,6 +1043,7 @@ std::string LoadActiveCloudSessionBaseUrl(
 
 std::string LoadActiveCloudSessionId(const AuthSession& auth)
 {
+    std::lock_guard<std::recursive_mutex> lock(g_active_cloud_session_mutex);
     const std::string body = ReadTextFile(GetActiveCloudSessionPath());
     if (body.empty())
         return "";
@@ -1038,6 +1063,7 @@ std::string LoadActiveCloudSessionId(const AuthSession& auth)
 
 void ForgetActiveCloudSession(const std::string& session_id)
 {
+    std::lock_guard<std::recursive_mutex> lock(g_active_cloud_session_mutex);
     const std::string body = ReadTextFile(GetActiveCloudSessionPath());
     if (!body.empty())
     {

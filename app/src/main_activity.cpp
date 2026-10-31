@@ -2,7 +2,10 @@
 
 #include "app_state.hpp"
 #include "gfn_client.hpp"
-#include "home_shortcut_policy.hpp"
+#include "game_detail_view.hpp"
+#include "home_shortcut.hpp"
+#include "shortcut_worker.hpp"
+#include "home_artwork_toast.hpp"
 #include "main_tabs_view.hpp"
 #include "localization.hpp"
 #include "runtime_journal.hpp"
@@ -76,9 +79,11 @@ class StartupGateView final : public brls::Box
 {
   public:
     explicit StartupGateView(
-        std::optional<shortcut::LaunchRequest> launch_request)
+        std::optional<shortcut::LaunchRequest> launch_request,
+        std::optional<shortcut::InstallerResult> installer_result)
         : brls::Box(brls::Axis::COLUMN)
         , launch_request_(std::move(launch_request))
+        , installer_result_(std::move(installer_result))
     {
         setGrow(1.0f);
         setAlignItems(brls::AlignItems::CENTER);
@@ -96,6 +101,14 @@ class StartupGateView final : public brls::Box
         }
 
         LogRuntimeEvent("auth", "startup_saved_session_found");
+        if (installer_result_)
+        {
+            // Restore the already running game page immediately after handoff.
+            // Play performs its normal session freshness check when selected.
+            AppState::Instance().SetSession(std::move(saved));
+            ShowMainTabs();
+            return;
+        }
         BuildStatusView(saved);
         BeginAuthentication(std::move(client), std::move(saved));
     }
@@ -166,7 +179,7 @@ class StartupGateView final : public brls::Box
             if (!alive->load() || finished_)
                 return;
             status_label_->setText(Tr(title));
-            detail_label_->setText(Tr(detail));
+            detail_label_->setText(TrMessage(detail));
         });
     }
 
@@ -179,7 +192,7 @@ class StartupGateView final : public brls::Box
             AppState::Instance().SetSession(std::move(session));
             ShowMainTabs();
             if (!notification.empty())
-                brls::Application::notify(notification);
+                brls::Application::notify(Tr(notification));
         });
     }
 
@@ -192,13 +205,13 @@ class StartupGateView final : public brls::Box
                      saved = std::move(saved)]() mutable {
             try
             {
-                SetStatus("Checking NVIDIA session",
-                          "Refreshing authorization and verifying account access.");
+                SetStatus(opennow::Tr("Checking NVIDIA session"),
+                          opennow::Tr("Refreshing authorization and verifying account access."));
                 AuthSession verified = client.RecoverSavedSession(
                     saved,
                     false,
                     [this](const std::string& status) {
-                        SetStatus("Signing in automatically", status);
+                        SetStatus(opennow::Tr("Signing in automatically"), status);
                     },
                     [alive]() { return !alive->load(); });
 
@@ -209,7 +222,7 @@ class StartupGateView final : public brls::Box
                         "cancelled");
                     return;
                 }
-                SetStatus("Account verified", "Loading SwitchNOW and your saved profile.");
+                SetStatus(opennow::Tr("Account verified"), opennow::Tr("Loading SwitchNOW and your saved profile."));
                 verified.reauthentication_required = false;
                 EndRuntimeOperation(
                     operation_id, "auth", "startup_session_recovery", "ok");
@@ -279,8 +292,18 @@ class StartupGateView final : public brls::Box
         brls::Application::giveFocus(tabs);
         const auto alive = alive_;
         brls::sync([this, alive] {
-            if (alive->load())
-                MaybeLaunchShortcut();
+            if (!alive->load()) return;
+            if (installer_result_)
+            {
+                auto result = std::move(*installer_result_);
+                installer_result_.reset();
+                if (!RestoreShortcutGameDetail(result))
+                    ShowDialog(result.success ? Tr("HOME shortcut created")
+                                              : Tr("HOME shortcut installation failed"),
+                               result.success ? result.title : result.error);
+                return;
+            }
+            MaybeLaunchShortcut();
         });
     }
 
@@ -289,7 +312,7 @@ class StartupGateView final : public brls::Box
         if (!launch_request_)
             return;
 
-        const shortcut::LaunchRequest request = std::move(*launch_request_);
+        shortcut::LaunchRequest request = std::move(*launch_request_);
         launch_request_.reset();
         const auto& session = AppState::Instance().session();
         if (!session)
@@ -310,24 +333,33 @@ class StartupGateView final : public brls::Box
         LogRuntimeEvent(
             "shortcut", "direct_launch",
             "title=" + request.title + " launch_app_id=" + request.launch_app_id);
+        // Start the game first. The artwork task never owns the launch flow.
         GfnClient client;
-        LaunchSessionDialog(
-            client, *session, request.launch_app_id, request.title,
+        LaunchSessionDialog(client, *session, request.launch_app_id, request.title,
             request.store, request.title, request.game_id, request.image_url);
+        if (!request.manifest_path.empty())
+        {
+            shortcut::RunTask([request, session = *session]() mutable {
+                if (shortcut::RefreshGameShortcut(request, session))
+                    brls::sync([] { shortcut::ShowHomeArtworkToast(); });
+            });
+        }
     }
 
     brls::Label* status_label_ = nullptr;
     brls::Label* detail_label_ = nullptr;
     std::shared_ptr<std::atomic_bool> alive_ = std::make_shared<std::atomic_bool>(true);
     std::optional<shortcut::LaunchRequest> launch_request_;
+    std::optional<shortcut::InstallerResult> installer_result_;
     bool finished_ = false;
 };
 
 } // namespace
 
 MainActivity::MainActivity(
-    std::optional<shortcut::LaunchRequest> launch_request)
-    : brls::Activity(new StartupGateView(std::move(launch_request)))
+    std::optional<shortcut::LaunchRequest> launch_request,
+    std::optional<shortcut::InstallerResult> installer_result)
+    : brls::Activity(new StartupGateView(std::move(launch_request), std::move(installer_result)))
 {
 }
 

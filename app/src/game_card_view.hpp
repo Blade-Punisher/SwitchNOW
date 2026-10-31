@@ -7,6 +7,7 @@
 
 namespace opennow
 {
+class ThumbnailImage;
 
 struct GameCardDisplay
 {
@@ -25,6 +26,7 @@ class GameCardView : public brls::Box
 
     void onFocusGained() override;
     void onFocusLost() override;
+    void frame(brls::FrameContext* ctx) override;
 
   private:
     void UpdateChrome(bool focused);
@@ -32,7 +34,8 @@ class GameCardView : public brls::Box
 
     GameCardDisplay display_;
     ClickHandler click_handler_;
-    brls::Image* image_         = nullptr;
+    ThumbnailImage* image_      = nullptr;
+    bool thumbnail_active_     = false;
     brls::Label* title_label_   = nullptr;
     brls::Label* subtitle_label_ = nullptr;
 };

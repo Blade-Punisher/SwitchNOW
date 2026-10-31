@@ -37,8 +37,8 @@ QrLoginDialog::QrLoginDialog(const LoginProvider& provider, const GfnClient& cli
 
     instruction_label_ = new brls::Label();
     instruction_label_->setText(is_nvidia
-        ? "Fast, console-first sign-in. Your saved account is ready without opening the limited Switch browser."
-        : "This GeForce NOW Alliance account uses the operator's own secure sign-in page. Continue on a phone or PC.");
+        ? opennow::Tr("Fast, console-first sign-in. Your saved account is ready without opening the limited Switch browser.")
+        : opennow::Tr("This GeForce NOW Alliance account uses the operator's own secure sign-in page. Continue on a phone or PC."));
     instruction_label_->setFontSize(16);
     instruction_label_->setTextColor(nvgRGB(145, 153, 165));
     instruction_label_->setMarginBottom(18);
@@ -154,11 +154,11 @@ QrLoginDialog::QrLoginDialog(const LoginProvider& provider, const GfnClient& cli
 
     auto* action_hint = new brls::Label();
     action_hint->setText(saved_credentials_
-        ? "Continue with the saved profile, or choose another NVIDIA account."
+        ? opennow::Tr("Continue with the saved profile, or choose another NVIDIA account.")
         : (is_nvidia
             ? Tr("Sign in directly inside SwitchNOW. Password saving remains optional.")
-            : "SwitchNOW will request OAuth for " + provider_.display_name +
-                " and preserve the resulting refresh token."));
+            : opennow::Tr("SwitchNOW will request OAuth for ") + provider_.display_name +
+                opennow::Tr(" and preserve the resulting refresh token.")));
     action_hint->setFontSize(14);
     action_hint->setTextColor(nvgRGB(142, 150, 161));
     action_hint->setMarginBottom(16);
@@ -170,10 +170,10 @@ QrLoginDialog::QrLoginDialog(const LoginProvider& provider, const GfnClient& cli
     device_login_button_->setCornerRadius(12);
     device_login_button_->setFontSize(21);
     device_login_button_->setText(saved_credentials_
-        ? "Quick sign in as " + saved_credentials_->email
+        ? opennow::Tr("Quick sign in as ") + saved_credentials_->email
         : (is_nvidia
             ? Tr("Sign in inside SwitchNOW")
-            : "Continue with " + provider_.display_name));
+            : opennow::Tr("Continue with ") + provider_.display_name));
     device_login_button_->setMarginBottom(10);
     device_login_button_->registerClickAction([this](brls::View* view) {
         return StartDeviceLogin(view);
@@ -237,7 +237,7 @@ QrLoginDialog::QrLoginDialog(const LoginProvider& provider, const GfnClient& cli
         remember_password_button_->setCornerRadius(9);
         remember_password_button_->setFontSize(15);
         remember_password_button_->setText(
-            std::string("Save password: ") + (remember_password_ ? "ON" : "OFF"));
+            std::string(opennow::Tr("Save password: ")) + (remember_password_ ? opennow::Tr("ON") : opennow::Tr("OFF")));
         remember_password_button_->registerClickAction([this](brls::View* view) {
             return ToggleRememberPassword(view);
         });
@@ -291,10 +291,10 @@ bool QrLoginDialog::ToggleRememberLogin(brls::View* view)
     if (login_active_)
         return true;
     remember_login_ = !remember_login_;
-    remember_button_->setText(std::string("Remember sign-in: ") + (remember_login_ ? "ON" : "OFF"));
+    remember_button_->setText(std::string(opennow::Tr("Remember sign-in: ")) + (remember_login_ ? opennow::Tr("ON") : opennow::Tr("OFF")));
     instruction_label_->setText(remember_login_
-        ? "OAuth tokens will be saved and renewed automatically. Password storage is controlled separately below."
-        : "This account will be used until SwitchNOW closes and will not be saved.");
+        ? opennow::Tr("OAuth tokens will be saved and renewed automatically. Password storage is controlled separately below.")
+        : opennow::Tr("This account will be used until SwitchNOW closes and will not be saved."));
     return true;
 }
 
@@ -305,10 +305,10 @@ bool QrLoginDialog::ToggleRememberPassword(brls::View* view)
         return true;
     remember_password_ = !remember_password_;
     remember_password_button_->setText(
-        std::string("Save password: ") + (remember_password_ ? "ON" : "OFF"));
+        std::string(opennow::Tr("Save password: ")) + (remember_password_ ? opennow::Tr("ON") : opennow::Tr("OFF")));
     instruction_label_->setText(remember_password_
-        ? "The password will be stored in the encrypted SwitchNOW vault for one-button sign-in."
-        : "The password will not be stored. Saved credentials are removed after the next successful sign-in.");
+        ? opennow::Tr("The password will be stored in the encrypted SwitchNOW vault for one-button sign-in.")
+        : opennow::Tr("The password will not be stored. Saved credentials are removed after the next successful sign-in."));
     return true;
 }
 
@@ -328,7 +328,7 @@ void QrLoginDialog::ShowEmailWaitingDialog(const std::string& status)
     if (email_waiting_dialog_)
     {
         if (email_waiting_label_)
-            email_waiting_label_->setText(status);
+            email_waiting_label_->setText(TrMessage(status));
         return;
     }
 
@@ -347,7 +347,7 @@ void QrLoginDialog::ShowEmailWaitingDialog(const std::string& status)
     content->addView(spinner);
 
     email_waiting_label_ = new brls::Label();
-    email_waiting_label_->setText(status);
+    email_waiting_label_->setText(TrMessage(status));
     email_waiting_label_->setFontSize(20);
     email_waiting_label_->setMarginBottom(12);
     content->addView(email_waiting_label_);
@@ -366,7 +366,7 @@ void QrLoginDialog::ShowEmailWaitingDialog(const std::string& status)
         email_waiting_dialog_ = nullptr;
         email_waiting_label_ = nullptr;
         status_label_->setText(Tr("Cancelling sign-in..."));
-        instruction_label_->setText("The NVIDIA email approval request is being cancelled.");
+        instruction_label_->setText(opennow::Tr("The NVIDIA email approval request is being cancelled."));
     });
     dialog->open();
 }
@@ -390,7 +390,7 @@ void QrLoginDialog::CompleteLogin(const AuthSession& session)
         client_.SaveSession(active_session);
     AppState::Instance().SetSession(active_session);
     brls::Application::notify(
-        std::string(remember_login_ ? "Account saved: " : "Signed in for this launch: ") +
+        std::string(remember_login_ ? opennow::Tr("Account saved: ") : opennow::Tr("Signed in for this launch: ")) +
         session.user.display_name);
     brls::Application::popActivity();
     if (on_success_)
@@ -443,8 +443,8 @@ std::string QrLoginDialog::PromptText(
     {
         swkbdConfigSetStringLenMax(&keyboard, password ? 128 : 254);
     }
-    swkbdConfigSetHeaderText(&keyboard, title.c_str());
-    swkbdConfigSetOkButtonText(&keyboard, "Continue");
+    swkbdConfigSetHeaderText(&keyboard, TrMessage(title).c_str());
+    swkbdConfigSetOkButtonText(&keyboard, Tr("Continue").c_str());
     if (!initial.empty() && !password)
         swkbdConfigSetInitialText(&keyboard, initial.c_str());
     std::array<char, 512> output {};
@@ -501,7 +501,7 @@ bool QrLoginDialog::StartNativeLogin(bool force_prompt)
             initial_email = saved_credentials_->email;
         else if (AppState::Instance().HasSession())
             initial_email = AppState::Instance().session()->user.email;
-        credentials.email = PromptText("NVIDIA account email", initial_email, false);
+        credentials.email = PromptText(opennow::Tr("NVIDIA account email"), initial_email, false);
         if (credentials.email.empty())
         {
             LogRuntimeEvent("auth_ui", "native_login_cancelled", "stage=email");
@@ -509,7 +509,7 @@ bool QrLoginDialog::StartNativeLogin(bool force_prompt)
             login_active_.store(false);
             return true;
         }
-        credentials.password = PromptText("NVIDIA account password", {}, true);
+        credentials.password = PromptText(opennow::Tr("NVIDIA account password"), {}, true);
         if (credentials.password.empty())
         {
             LogRuntimeEvent("auth_ui", "native_login_cancelled", "stage=password");
@@ -552,7 +552,7 @@ bool QrLoginDialog::StartNativeLogin(bool force_prompt)
                         if (!guard->load())
                             return;
                         status_label_->setText(Tr("Waiting for NVIDIA verification"));
-                        instruction_label_->setText(status + " Press B or Cancel to stop.");
+                        instruction_label_->setText(TrMessage(status) + opennow::Tr(" Press B or Cancel to stop."));
                         ShowEmailWaitingDialog(status);
                     });
                 },
@@ -597,7 +597,7 @@ bool QrLoginDialog::StartNativeLogin(bool force_prompt)
                 CloseEmailWaitingDialog();
                 status_label_->setText(Tr("NVIDIA requires an external verification step"));
                 instruction_label_->setText(message +
-                    ". Use the phone / PC fallback below; the limited Switch browser is not required.");
+                    opennow::Tr(". Use the phone / PC fallback below; the limited Switch browser is not required."));
                 login_active_.store(false);
             });
         }
@@ -611,11 +611,11 @@ bool QrLoginDialog::StartNativeLogin(bool force_prompt)
                     return;
                 CloseEmailWaitingDialog();
                 status_label_->setText(message.find("cancelled") != std::string::npos
-                    ? "Sign-in cancelled"
-                    : "Native NVIDIA login failed");
+                    ? opennow::Tr("Sign-in cancelled")
+                    : opennow::Tr("Native NVIDIA login failed"));
                 instruction_label_->setText(message.find("cancelled") != std::string::npos
-                    ? "You can start the internal sign-in again when ready."
-                    : message + ". Retry, enter another account, or use the phone / PC fallback.");
+                    ? opennow::Tr("You can start the internal sign-in again when ready.")
+                    : message + opennow::Tr(". Retry, enter another account, or use the phone / PC fallback."));
                 login_active_.store(false);
             });
         }
@@ -649,9 +649,9 @@ void QrLoginDialog::StartQrLoginProcess()
                 brls::sync([this]() {
                     status_label_->setText(Tr("Scan the QR code with your phone or PC"));
                     instruction_label_->setText(
-                        "Open the Switch page, sign in to " + provider_.display_name +
-                        ", then paste the final localhost:2259 URL into that page. "
-                        "You will not need to repeat this while the saved refresh token remains valid.");
+                        opennow::Tr("Open the Switch page, sign in to ") + provider_.display_name +
+                        opennow::Tr(", then paste the final localhost:2259 URL into that page. "
+                        "You will not need to repeat this while the saved refresh token remains valid."));
                     url_label_->setText(auth_url_);
                 });
             };

@@ -31,5 +31,20 @@ int main()
     // RTP wraparound must retain signed timestamp ordering.
     assert(RtpDelta(0x00000100u, 0xfffffff0u) > 0);
     assert(RtpDelta(0xfffffff0u, 0x00000100u) < 0);
+    assert(!ShouldResyncForDamagedFrame(90000, 91500, true));
+    assert(ShouldResyncForDamagedFrame(93000, 91500, true));
+    assert(ShouldResyncForDamagedFrame(90000, 0, false));
+    assert(!ShouldResyncForDamagedFrame(0xfffffff0u, 0x00000100u, true));
+    assert(WaitBudgetAfterMisses(6500, 2) == 6500);
+    assert(WaitBudgetAfterMisses(6500, 3) == 1500);
+    assert(ClassifyFrameArrival(1500, 16667, 1500) == FrameArrivalKind::Regular);
+    assert(ClassifyFrameArrival(3000, 33334, 1500) == FrameArrivalKind::TimestampGap);
+    assert(ClassifyFrameArrival(1500, 32000, 1500) == FrameArrivalKind::DeliveryGap);
+    assert(ClassifyFrameArrival(1500, 3000, 1500) == FrameArrivalKind::Burst);
+    assert(PredictFrameWaitUs(4500, 0, 16667, 1000, 15000) > 3000);
+    assert(PredictFrameWaitUs(6500, 3, 16667, 9000, 16000) == 1500);
+    assert(PredictFrameWaitUs(4500, 0, 16667, 2000, 60000) == 0);
+    assert(PredictFrameWaitUs(4500, 0, 16667, 2000, 1000) == 0);
+    assert(PredictFrameWaitUs(0, 0, 16667, 2000, 16000) == 0);
     return 0;
 }

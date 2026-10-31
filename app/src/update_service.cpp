@@ -4,6 +4,7 @@
 #include "app_paths.hpp"
 #include "runtime_journal.hpp"
 #include "update_policy.hpp"
+#include "../updater/update_target.h"
 
 #include <borealis.hpp>
 #include <curl/curl.h>
@@ -34,9 +35,10 @@ constexpr const char* kHelperSdPath = "sdmc:/switch/SwitchNOW/SwitchNOWUpdater.n
 constexpr std::size_t kMetadataLimit = 512 * 1024;
 constexpr std::size_t kNroLimit = 64 * 1024 * 1024;
 
-std::string StagedPath() { return std::string(kCanonicalNroPath) + ".update"; }
+std::string executable_path;
+std::string StagedPath() { return executable_path + ".update"; }
 std::string MarkerPath() { return StagedPath() + ".sha256"; }
-std::string BackupPath() { return std::string(kCanonicalNroPath) + ".previous"; }
+std::string BackupPath() { return executable_path + ".previous"; }
 
 struct MemoryBuffer
 {
@@ -68,6 +70,8 @@ std::size_t WriteFile(char* data, std::size_t size, std::size_t count, void* opa
 {
     auto* output = static_cast<FileBuffer*>(opaque);
     const std::size_t received = size * count;
+    if (received > kNroLimit || output->written > kNroLimit - received)
+        return 0;
     output->stream.write(data, static_cast<std::streamsize>(received));
     if (!output->stream)
         return 0;
@@ -290,6 +294,14 @@ bool ParseChecksumList(const std::string& body, const std::string& asset, std::s
 
 } // namespace
 
+void SetExecutablePath(const std::string& path) {
+    std::string normalized = path;
+    if (normalized.rfind("/switch/", 0) == 0) normalized = "sdmc:" + normalized;
+    executable_path = update_target_valid(normalized.c_str()) ? normalized : std::string{};
+}
+
+const std::string& ExecutablePath() { return executable_path; }
+
 CheckResult CheckLatestRelease(const std::string& current_version)
 {
     CheckResult result;
@@ -312,6 +324,12 @@ CheckResult CheckLatestRelease(const std::string& current_version)
         return result;
     }
     result.release.version = json_string_value(tag);
+    Version current, candidate;
+    if (!ParseVersion(current_version, current) || !ParseVersion(result.release.version, candidate)) {
+        json_decref(root);
+        result.error = "Could not compare the installed version with the release version.";
+        return result;
+    }
     result.update_available = IsNewerVersion(result.release.version, current_version);
     if (!result.update_available)
     {
@@ -384,6 +402,10 @@ CheckResult CheckLatestRelease(const std::string& current_version)
 
 bool StageRelease(const ReleaseInfo& release, const ProgressCallback& progress, std::string& error)
 {
+    if (executable_path.empty() || !IsNro(executable_path)) {
+        error = "Could not locate the running NRO. Launch SwitchNOW from its NRO in the switch folder.";
+        return false;
+    }
     if (!IsTrustedReleaseAsset(release.download_url))
     {
         error = "The update asset URL is not trusted.";
@@ -399,6 +421,10 @@ bool StageRelease(const ReleaseInfo& release, const ProgressCallback& progress, 
     std::string expected = release.sha256;
     if (expected.empty())
     {
+        if (!IsTrustedReleaseAsset(release.checksum_url)) {
+            error = "The update checksum URL is not trusted.";
+            return false;
+        }
         std::string checksums;
         if (!FetchText(release.checksum_url, 64 * 1024, checksums, error) ||
             !ParseChecksumList(checksums, release.asset_name, expected))
@@ -439,7 +465,7 @@ bool StageRelease(const ReleaseInfo& release, const ProgressCallback& progress, 
         return false;
     }
 #endif
-    LogRuntimeEvent("update", "staged", "version=" + release.version + " bytes=" + std::to_string(written));
+    LogRuntimeEvent("update", "staged", "version=" + release.version + " target=" + executable_path + " bytes=" + std::to_string(written));
     return true;
 }
 
@@ -452,7 +478,14 @@ bool LaunchUpdateHelper(std::string& error)
         error = "The staged update or update helper is missing.";
         return false;
     }
-    envSetNextLoad(kHelperSdPath, "\"sdmc:/switch/SwitchNOW/SwitchNOWUpdater.nro\" --finish-update");
+    if (!update_target_valid(executable_path.c_str())) {
+        error = "The running NRO path is unavailable.";
+        return false;
+    }
+    const std::string arguments = std::string("\"") + kHelperSdPath +
+        "\" --finish-update \"" + executable_path + "\"";
+    envSetNextLoad(kHelperSdPath, arguments.c_str());
+    LogRuntimeEvent("update", "handoff", "target=" + executable_path);
     brls::Application::quit();
     return true;
 #else
@@ -463,9 +496,19 @@ bool LaunchUpdateHelper(std::string& error)
 
 void ConfirmInstalledUpdate()
 {
+    if (executable_path.empty()) return;
     struct stat info {};
     if (stat(BackupPath().c_str(), &info) != 0)
         return;
+    std::ifstream marker(MarkerPath());
+    std::string expected, actual, error;
+    marker >> expected;
+    marker.close();
+    expected = NormalizeChecksum(expected);
+    if (expected.empty() || !Sha256File(executable_path, actual, error) || actual != expected) {
+        LogRuntimeEvent("update", "confirmation_failed", "backup retained target=" + executable_path);
+        return;
+    }
     std::remove(BackupPath().c_str());
     std::remove(MarkerPath().c_str());
     std::remove(kHelperSdPath);

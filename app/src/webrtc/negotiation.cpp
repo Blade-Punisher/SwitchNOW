@@ -1,6 +1,6 @@
 #include "webrtc_session.hpp"
+#include "nvst_sdp.hpp"
 #include "stream/RemoteCandidatePolicy.hpp"
-#include "video_quality_policy.hpp"
 #include "internal.hpp"
 
 #include <jansson.h>
@@ -87,16 +87,9 @@ int ParseIntegerAttribute(const std::string& sdp, const std::string& attribute, 
     return fallback;
 }
 
-struct RiInputCapabilities {
-    int partial_reliable_threshold_ms = 16;
-    uint32_t hid_device_mask = 0xffffffffu;
-    uint32_t partial_reliable_gamepad_mask = 0x0fu;
-    uint32_t partial_reliable_hid_mask = 0xffffffffu;
-};
-
-RiInputCapabilities ParseRiInputCapabilities(const std::string& offer_sdp)
+opennow::webrtc::RiInputCapabilities ParseRiInputCapabilities(const std::string& offer_sdp)
 {
-    RiInputCapabilities caps;
+    opennow::webrtc::RiInputCapabilities caps;
     const int threshold = ParseIntegerAttribute(offer_sdp, "ri.partialReliableThresholdMs", caps.partial_reliable_threshold_ms);
     if (threshold > 0)
         caps.partial_reliable_threshold_ms = std::max(1, std::min(5000, threshold));
@@ -148,7 +141,7 @@ std::vector<std::string> FindRtcpFbForPayload(const std::vector<std::string>& li
     std::vector<std::string> feedback;
     const std::string prefix = "a=rtcp-fb:" + std::to_string(payload_type) + " ";
     for (const auto& line : lines) {
-        if (StartsWithString(line, prefix))
+        if (line == prefix + "nack" || line == prefix + "nack pli")
             feedback.push_back(line);
     }
     return feedback;
@@ -401,27 +394,61 @@ std::string AdaptAnswerSdpToOffer(
     const std::vector<std::string> offer_lines = SplitSdpLines(offer_sdp);
     const std::string offer_h264_fmtp = FindFmtpForPayload(offer_lines, h264_payload_type);
     const std::vector<std::string> offer_h264_feedback = FindRtcpFbForPayload(offer_lines, h264_payload_type);
+    std::string offer_audio_red_rtpmap;
+    std::string offer_audio_red_fmtp;
+    bool offer_in_audio = false;
+    for (const auto& line : offer_lines) {
+        if (StartsWith(line, "m=")) {
+            offer_in_audio = StartsWith(line, "m=audio");
+            continue;
+        }
+        if (!offer_in_audio)
+            continue;
+        if (StartsWithString(line, "a=rtpmap:63 ") &&
+            (line.find("red/48000") != std::string::npos ||
+             line.find("RED/48000") != std::string::npos)) {
+            offer_audio_red_rtpmap = line;
+        } else if (StartsWithString(line, "a=fmtp:63 ")) {
+            offer_audio_red_fmtp = line;
+        }
+    }
     std::vector<std::string> lines = SplitSdpLines(answer_sdp);
     std::vector<std::string> out;
     bool in_video = false;
+    bool in_audio = false;
     bool video_bitrate_added = false;
     bool video_feedback_added = false;
+    bool audio_red_added = false;
 
     const std::string payload = std::to_string(h264_payload_type);
 
     for (const auto& line : lines) {
         if (StartsWith(line, "m=")) {
             in_video = StartsWith(line, "m=video");
+            in_audio = StartsWith(line, "m=audio");
             if (in_video) {
                 out.push_back("m=video 9 UDP/TLS/RTP/SAVPF " + payload);
                 continue;
-            } else if (StartsWith(line, "m=audio")) {
-                out.push_back("m=audio 9 UDP/TLS/RTP/SAVPF 111");
+            } else if (in_audio) {
+                out.push_back(offer_audio_red_rtpmap.empty()
+                    ? "m=audio 9 UDP/TLS/RTP/SAVPF 111"
+                    : "m=audio 9 UDP/TLS/RTP/SAVPF 111 63");
                 continue;
             } else if (StartsWith(line, "m=application")) {
                 out.push_back("m=application 9 UDP/DTLS/SCTP webrtc-datachannel");
                 continue;
             }
+        }
+
+        if (in_audio && !audio_red_added && StartsWith(line, "a=rtpmap:111")) {
+            out.push_back(line);
+            if (!offer_audio_red_rtpmap.empty()) {
+                out.push_back(offer_audio_red_rtpmap);
+                if (!offer_audio_red_fmtp.empty())
+                    out.push_back(offer_audio_red_fmtp);
+            }
+            audio_red_added = true;
+            continue;
         }
 
         if (in_video && StartsWith(line, "c=IN ")) {
@@ -437,10 +464,10 @@ std::string AdaptAnswerSdpToOffer(
                     for (const auto& feedback : offer_h264_feedback)
                         out.push_back(feedback);
                 } else {
-                    out.push_back("a=rtcp-fb:" + payload + " transport-cc");
-                    out.push_back("a=rtcp-fb:" + payload + " ccm fir");
                     out.push_back("a=rtcp-fb:" + payload + " nack");
                     out.push_back("a=rtcp-fb:" + payload + " nack pli");
+                    out.push_back("a=rtcp-fb:" + payload + " transport-cc");
+                    out.push_back("a=rtcp-fb:" + payload + " ccm fir");
                 }
                 video_feedback_added = true;
             }
@@ -505,108 +532,6 @@ int ExtractNvstIntValue(const std::string& nvst_sdp, const std::string& prefix)
             return static_cast<int>(parsed);
     }
     return 0;
-}
-
-std::string BuildNvstSdp(
-    const std::string& answer_sdp,
-    const opennow::StreamSettings& settings,
-    const RiInputCapabilities& ri_caps)
-{
-    const std::string ice_ufrag = ExtractSdpValue(answer_sdp, "a=ice-ufrag:");
-    const std::string ice_pwd = ExtractSdpValue(answer_sdp, "a=ice-pwd:");
-    const std::string fingerprint = ExtractSdpValue(answer_sdp, "a=fingerprint:sha-256 ");
-    const auto tuning = opennow::video::ResolveQualityTuning(settings.image_quality_mode);
-    const int min_bitrate = std::max(
-        5000, (settings.bitrate_kbps * tuning.minimum_bitrate_percent) / 100);
-    const int initial_bitrate = std::max(
-        min_bitrate, (settings.bitrate_kbps * tuning.initial_bitrate_percent) / 100);
-
-    std::vector<std::string> lines = {
-        "v=0",
-        "o=SdpTest test_id_13 14 IN IPv4 127.0.0.1",
-        "s=-",
-        "t=0 0",
-        "a=general.icePassword:" + ice_pwd,
-        "a=general.iceUserNameFragment:" + ice_ufrag,
-        "a=general.dtlsFingerprint:" + fingerprint,
-        "m=video 0 RTP/AVP",
-        "a=msid:fbc-video-0",
-        "a=vqos.fec.rateDropWindow:10",
-        "a=vqos.fec.minRequiredFecPackets:2",
-        "a=vqos.fec.repairMinPercent:" + std::to_string(tuning.fec_repair_min_percent),
-        "a=vqos.fec.repairPercent:" + std::to_string(tuning.fec_repair_percent),
-        "a=vqos.fec.repairMaxPercent:" + std::to_string(tuning.fec_repair_max_percent),
-        "a=vqos.dynamicStreamingMode:0",
-        "a=vqos.drc.enable:0",
-        "a=vqos.dfc.enable:0",
-        "a=vqos.dfc.adjustResAndFps:0",
-        "a=video.dx9EnableNv12:1",
-        "a=video.dx9EnableHdr:1",
-        "a=vqos.qpg.enable:1",
-        "a=vqos.resControl.qp.qpg.featureSetting:7",
-        "a=bwe.useOwdCongestionControl:1",
-        "a=video.enableRtpNack:1",
-        "a=vqos.bw.txRxLag.minFeedbackTxDeltaMs:200",
-        "a=vqos.drc.bitrateIirFilterFactor:18",
-        "a=video.packetSize:1140",
-        "a=packetPacing.minNumPacketsPerGroup:" +
-            std::to_string(tuning.pacing_min_packets_per_group),
-        "a=vqos.adjustStreamingFpsDuringOutOfFocus:1",
-        "a=vqos.resControl.cpmRtc.ignoreOutOfFocusWindowState:1",
-        "a=vqos.resControl.perfHistory.rtcIgnoreOutOfFocusWindowState:1",
-        "a=vqos.resControl.cpmRtc.featureMask:0",
-        "a=vqos.resControl.cpmRtc.enable:0",
-        "a=vqos.resControl.cpmRtc.minResolutionPercent:100",
-        "a=vqos.resControl.cpmRtc.resolutionChangeHoldonMs:999999",
-        "a=packetPacing.numGroups:" + std::to_string(tuning.pacing_groups),
-        "a=packetPacing.maxDelayUs:" + std::to_string(tuning.pacing_max_delay_us),
-        "a=packetPacing.minNumPacketsFrame:10",
-        "a=video.rtpNackQueueLength:1024",
-        "a=video.rtpNackQueueMaxPackets:512",
-        "a=video.rtpNackMaxPacketCount:25",
-        "a=vqos.drc.qpMaxResThresholdAdj:4",
-        "a=vqos.grc.qpMaxResThresholdAdj:4",
-        "a=vqos.drc.iirFilterFactor:100",
-        "a=video.clientViewportWd:" + std::to_string(settings.width),
-        "a=video.clientViewportHt:" + std::to_string(settings.height),
-        "a=video.maxFPS:" + std::to_string(settings.fps),
-        "a=video.initialBitrateKbps:" + std::to_string(initial_bitrate),
-        "a=video.initialPeakBitrateKbps:" + std::to_string(settings.bitrate_kbps),
-        "a=vqos.bw.maximumBitrateKbps:" + std::to_string(settings.bitrate_kbps),
-        "a=vqos.bw.minimumBitrateKbps:" + std::to_string(min_bitrate),
-        "a=vqos.bw.peakBitrateKbps:" + std::to_string(settings.bitrate_kbps),
-        "a=vqos.bw.serverPeakBitrateKbps:" + std::to_string(settings.bitrate_kbps),
-        "a=vqos.bw.enableBandwidthEstimation:1",
-        "a=vqos.bw.disableBitrateLimit:0",
-        "a=vqos.grc.maximumBitrateKbps:" + std::to_string(settings.bitrate_kbps),
-        "a=vqos.grc.enable:0",
-        "a=video.maxNumReferenceFrames:4",
-        "a=video.mapRtpTimestampsToFrames:1",
-        "a=video.encoderCscMode:3",
-        "a=video.dynamicRangeMode:0",
-        "a=video.bitDepth:8",
-        "a=video.scalingFeature1:0",
-        "a=video.prefilterParams.prefilterModel:0",
-        "m=audio 0 RTP/AVP",
-        "a=msid:audio",
-        "m=mic 0 RTP/AVP",
-        "a=msid:mic",
-        "a=rtpmap:0 PCMU/8000",
-        "m=application 0 RTP/AVP",
-        "a=msid:input_1",
-        "a=ri.partialReliableThresholdMs:" + std::to_string(ri_caps.partial_reliable_threshold_ms),
-        "a=ri.hidDeviceMask:" + std::to_string(ri_caps.hid_device_mask),
-        "a=ri.enablePartiallyReliableTransferGamepad:" + std::to_string(ri_caps.partial_reliable_gamepad_mask),
-        "a=ri.enablePartiallyReliableTransferHid:" + std::to_string(ri_caps.partial_reliable_hid_mask),
-        "",
-    };
-
-    std::string result;
-    for (const auto& line : lines) {
-        result += line;
-        result += "\n";
-    }
-    return result;
 }
 
 std::string ExtractSignalingHost(const std::string& url)
@@ -773,7 +698,20 @@ void WebRtcSession::handle_signaling_message(const std::string& msg) {
 
     json_error_t error;
     json_t* root = json_loads(msg.c_str(), 0, &error);
-    if (!root) return;
+    if(opennow::signaling::ObserveRegistration(signaling_registration_,root,peer_name_))
+        AppendStreamLog("SIGNAL_DIAG registration_confirmed attempts=" +
+            std::to_string(signaling_registration_.Attempts()) + " furtherPeerInfo=disabled");
+    const auto safe_envelope=signaling_diagnostics_.Observe(root,peer_name_);
+    if(!safe_envelope.empty()) AppendStreamLog(safe_envelope);
+    if (!root) {
+        AppendStreamLog("SIGNAL envelope parse_ok=0 bytes=" + std::to_string(msg.size()));
+        return;
+    }
+    if (signaling_rx_count_ <= 16 || json_object_get(root, "peer_msg"))
+        AppendStreamLog("SIGNAL envelope parse_ok=1 peer_info=" +
+            std::to_string(json_object_get(root, "peer_info") != nullptr) +
+            " peer_msg=" + std::to_string(json_object_get(root, "peer_msg") != nullptr) +
+            " heartbeat=" + std::to_string(json_object_get(root, "hb") != nullptr));
 
     json_t* peer_info = json_object_get(root, "peer_info");
     if (peer_info && json_is_object(peer_info)) {
@@ -785,23 +723,21 @@ void WebRtcSession::handle_signaling_message(const std::string& msg) {
         }
     }
 
-    json_t* ackid = json_object_get(root, "ackid");
-    if (ackid && json_is_integer(ackid)) {
-        bool should_ack = true;
-        if (peer_info && json_is_object(peer_info)) {
-            json_t* id = json_object_get(peer_info, "id");
-            should_ack = !json_is_integer(id) || static_cast<int>(json_integer_value(id)) != peer_id_;
+    // The server's own-identity notification is reliable too. Skipping its ACK
+    // leaves it pending even though our outgoing registration was confirmed.
+    if (const auto ackid = opennow::signaling::IncomingAckId(root)) {
+        json_t* ack = json_object();
+        json_object_set_new(ack, "ack", json_integer(*ackid));
+        char* dump = json_dumps(ack, 0);
+        const bool serialized = dump != nullptr;
+        bool written = false;
+        if (dump) {
+            written = signaling_client_->send_message(std::string(dump));
+            free(dump);
         }
-        if (should_ack) {
-            json_t* ack = json_object();
-            json_object_set_new(ack, "ack", json_integer(json_integer_value(ackid)));
-            char* dump = json_dumps(ack, 0);
-            if (dump) {
-                signaling_client_->send_message(std::string(dump));
-                free(dump);
-            }
-            json_decref(ack);
-        }
+        const auto safe_ack = signaling_diagnostics_.Ack(false, serialized, written);
+        if (!safe_ack.empty()) AppendStreamLog(safe_ack);
+        json_decref(ack);
     }
 
     if (json_object_get(root, "hb")) {
@@ -830,8 +766,13 @@ void WebRtcSession::handle_signaling_message(const std::string& msg) {
         if (raw_payload && json_is_string(raw_payload)) {
             json_error_t payload_error;
             json_t* payload = json_loads(json_string_value(raw_payload), 0, &payload_error);
+            AppendStreamLog(opennow::signaling::DescribePayload(payload,payload!=nullptr,json_string_length(raw_payload)));
             if (payload) {
                 json_t* type = json_object_get(payload, "type");
+                const auto kind = type && json_is_string(type) ? std::string(json_string_value(type)) : "missing";
+                AppendStreamLog("SIGNAL payload kind=" +
+                    std::string(kind == "offer" || kind == "answer" || kind == "candidate" ? kind : "other") +
+                    " has_sdp=" + std::to_string(json_is_string(json_object_get(payload, "sdp"))));
                 if (type && json_is_string(type) && std::string(json_string_value(type)) == "offer") {
                     json_t* sdp = json_object_get(payload, "sdp");
                     if (sdp && json_is_string(sdp) && pc_) {
@@ -848,8 +789,22 @@ void WebRtcSession::handle_signaling_message(const std::string& msg) {
                             nvst_offer && json_is_string(nvst_offer) ? json_string_value(nvst_offer) : "";
                         if (!nvst_offer_sdp.empty())
                             AppendTraceBlock("OFFER NVST SDP", nvst_offer_sdp);
+                        const int offered_bitrate_cap = ExtractNvstIntValue(
+                            nvst_offer_sdp, "a=vqos.bw.maximumBitrateKbps:");
+                        const int offered_initial_bitrate = ExtractNvstIntValue(
+                            nvst_offer_sdp, "a=video.initialBitrateKbps:");
+                        AppendStreamLog("BITRATE negotiation requestedKbps=" +
+                            std::to_string(settings_.bitrate_kbps) +
+                            " offerInitialKbps=" +
+                            std::to_string(offered_initial_bitrate) +
+                            " offerMaximumKbps=" +
+                            std::to_string(offered_bitrate_cap) +
+                            " offerBelowRequest=" + std::to_string(
+                                offered_bitrate_cap > 0 &&
+                                offered_bitrate_cap < settings_.bitrate_kbps ? 1 : 0));
                         server_ice_ufrag_ = ExtractSdpValue(offer_sdp, "a=ice-ufrag:");
-                        const RiInputCapabilities ri_caps = ParseRiInputCapabilities(offer_sdp);
+                        const opennow::webrtc::RiInputCapabilities ri_caps =
+                            ParseRiInputCapabilities(offer_sdp);
                         partial_reliable_threshold_ms_ = ri_caps.partial_reliable_threshold_ms;
                         const int offer_video_port = ExtractOfferMediaPort(offer_sdp, "video");
                         const int selected_h264_pt = SelectOfferH264PayloadType(offer_sdp);
@@ -873,7 +828,8 @@ void WebRtcSession::handle_signaling_message(const std::string& msg) {
                         if (answer_sdp) {
                             AppendTraceBlock("LIBPEER RAW ANSWER SDP", answer_sdp);
                             const std::string adapted_answer_sdp = AdaptAnswerSdpToOffer(answer_sdp, offer_sdp, settings_);
-                            const std::string nvst_sdp = BuildNvstSdp(adapted_answer_sdp, settings_, ri_caps);
+                            const std::string nvst_sdp = opennow::webrtc::BuildNvstSdp(
+                                adapted_answer_sdp, settings_, ri_caps);
                             AppendTraceBlock("ADAPTED ANSWER SDP", adapted_answer_sdp);
                             AppendTraceBlock("ANSWER NVST SDP", nvst_sdp);
                             AppendStreamLog("SDP answer created localUfrag=" +

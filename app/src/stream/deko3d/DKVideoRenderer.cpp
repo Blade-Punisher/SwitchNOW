@@ -24,6 +24,11 @@ constexpr unsigned kUpdateCommandSliceBytes = 0x1000;
 constexpr unsigned kUpdateCommandSlices = 8;
 constexpr size_t kSoftwareFrameSlots = 4;
 
+uint64_t monotonic_micros() {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
 uint64_t monotonic_millis()
 {
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -103,9 +108,15 @@ DKVideoRenderer::~DKVideoRenderer()
     if (video_context_)
         queue_.waitIdle();
     while (!submitted_frames_.empty()) {
-        AVFrame* frame = submitted_frames_.front();
+        AVFrame* frame = submitted_frames_.front().frame;
         submitted_frames_.pop_front();
         av_frame_free(&frame);
+    }
+    for (auto& mapping : frame_mappings_) {
+        if (video_context_ && mapping.luma_texture_id >= 0)
+            video_context_->freeImageIndex(mapping.luma_texture_id);
+        if (video_context_ && mapping.chroma_texture_id >= 0)
+            video_context_->freeImageIndex(mapping.chroma_texture_id);
     }
     frame_mappings_.clear();
     releaseSoftwareSlots();
@@ -113,9 +124,9 @@ DKVideoRenderer::~DKVideoRenderer()
     vertex_buffer_.destroy();
     transform_buffer_.destroy();
     if (video_context_) {
-        if (luma_texture_id_ > 0)
+        if (luma_texture_id_ >= 0)
             video_context_->freeImageIndex(luma_texture_id_);
-        if (chroma_texture_id_ > 0)
+        if (chroma_texture_id_ >= 0)
             video_context_->freeImageIndex(chroma_texture_id_);
     }
 }
@@ -123,12 +134,17 @@ DKVideoRenderer::~DKVideoRenderer()
 void DKVideoRenderer::releaseSoftwareSlots()
 {
     for (auto& slot : software_slots_) {
+        if (video_context_ && slot.luma_texture_id >= 0) video_context_->freeImageIndex(slot.luma_texture_id);
+        if (video_context_ && slot.chroma_texture_id >= 0) video_context_->freeImageIndex(slot.chroma_texture_id);
+        if (slot.draw_commands) slot.draw_commands.destroy();
+        slot.draw_memory.destroy();
         slot.luma_memory.destroy();
         slot.chroma_memory.destroy();
         slot.luma_upload.destroy();
         slot.chroma_upload.destroy();
     }
     software_slots_.clear();
+    immutable_software_descriptors_ = false;
 }
 
 void DKVideoRenderer::retainSubmittedFrame(AVFrame* frame)
@@ -139,7 +155,9 @@ void DKVideoRenderer::retainSubmittedFrame(AVFrame* frame)
         return;
     }
 
-    submitted_frames_.push_back(reference);
+    SubmittedFrame submitted;
+    submitted.frame = reference;
+    submitted_frames_.push_back(submitted);
     // Keep substantially more surfaces than the three display framebuffers.
     // This gives Deko3D ~133 ms at 60 fps to finish sampling without blocking
     // the UI thread or allowing NVDEC to immediately recycle the memory.
@@ -147,10 +165,14 @@ void DKVideoRenderer::retainSubmittedFrame(AVFrame* frame)
     if (submitted_frames_.size() <= kGpuFramesInFlight)
         return;
 
-    // Queue submission is ordered and the oldest reference is several display
-    // cycles behind. Never call waitIdle() here: an NVDEC/Deko dependency can
-    // otherwise block the Borealis render thread indefinitely.
-    AVFrame* completed = submitted_frames_.front();
+    // A frame count is not a completion guarantee. A rare GPU stall can exceed
+    // the retention window and let NVDEC recycle an image while Deko3D is still
+    // sampling it. Wait only for the oldest frame's final draw, never the whole
+    // queue, before returning that surface to NVDEC.
+    auto& oldest = submitted_frames_.front();
+    if (oldest.fence_submitted)
+        oldest.fence.wait();
+    AVFrame* completed = oldest.frame;
     submitted_frames_.pop_front();
     av_frame_free(&completed);
 }
@@ -247,8 +269,6 @@ void DKVideoRenderer::checkAndInitialize(int width, int height, AVFrame* frame)
     transform.quality[2] = tuning.denoise_strength;
     transform.quality[3] = tuning.sharpen_strength;
 
-    luma_texture_id_ = video_context_->allocateImageIndex();
-    chroma_texture_id_ = video_context_->allocateImageIndex();
     dk::ImageLayoutMaker{device_}
         .setType(DkImageType_2D).setFormat(DkImageFormat_R8_Unorm)
         .setDimensions(frame_width_, frame_height_, 1)
@@ -263,6 +283,20 @@ void DKVideoRenderer::checkAndInitialize(int width, int height, AVFrame* frame)
         .initialize(chroma_layout_);
 
     if (!hardware_frames_) {
+        luma_texture_id_ = video_context_->allocateImageIndex();
+        chroma_texture_id_ = video_context_->allocateImageIndex();
+        if (luma_texture_id_ < 0 || chroma_texture_id_ < 0) {
+            brls::Logger::error(
+                "Deko3D video descriptor allocation failed luma={} chroma={}",
+                luma_texture_id_, chroma_texture_id_);
+            if (luma_texture_id_ >= 0)
+                video_context_->freeImageIndex(luma_texture_id_);
+            if (chroma_texture_id_ >= 0)
+                video_context_->freeImageIndex(chroma_texture_id_);
+            luma_texture_id_ = -1;
+            chroma_texture_id_ = -1;
+            return;
+        }
         image_pool_.emplace(
             device_, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached |
                          DkMemBlockFlags_Image,
@@ -303,28 +337,67 @@ void DKVideoRenderer::checkAndInitialize(int width, int height, AVFrame* frame)
         }
     }
 
-    dk::RasterizerState rasterizer;
-    dk::ColorState color;
-    dk::ColorWriteState color_write;
-    static_cmd_buf_.clear();
-    static_cmd_buf_.clearColor(0, DkColorMask_RGBA, 0.0f, 0.0f, 0.0f, 1.0f);
-    static_cmd_buf_.bindShaders(DkStageFlag_GraphicsMask, {vertex_shader_, fragment_shader_});
-    static_cmd_buf_.bindTextures(DkStage_Fragment, 0,
-                                 dkMakeTextureHandle(luma_texture_id_, 0));
-    static_cmd_buf_.bindTextures(DkStage_Fragment, 1,
-                                 dkMakeTextureHandle(chroma_texture_id_, 0));
-    static_cmd_buf_.bindUniformBuffer(DkStage_Fragment, 0, transform_buffer_.getGpuAddr(),
-                                      transform_buffer_.getSize());
-    static_cmd_buf_.pushConstants(transform_buffer_.getGpuAddr(), transform_buffer_.getSize(),
-                                  0, sizeof(transform), &transform);
-    static_cmd_buf_.bindRasterizerState(rasterizer);
-    static_cmd_buf_.bindColorState(color);
-    static_cmd_buf_.bindColorWriteState(color_write);
-    static_cmd_buf_.bindVtxBuffer(0, vertex_buffer_.getGpuAddr(), vertex_buffer_.getSize());
-    static_cmd_buf_.bindVtxAttribState(kVertexAttributes);
-    static_cmd_buf_.bindVtxBufferState(kVertexBuffers);
-    static_cmd_buf_.draw(DkPrimitive_Quads, kQuadVertices.size(), 1, 0, 0);
-    static_cmd_list_ = static_cmd_buf_.finishList();
+    if (!hardware_frames_) {
+        immutable_software_descriptors_ = true;
+        for (auto& slot : software_slots_) {
+            slot.luma_texture_id = video_context_->allocateImageIndex();
+            slot.chroma_texture_id = video_context_->allocateImageIndex();
+            slot.draw_memory = data_pool_->allocate(kStaticCommandBytes);
+            slot.draw_commands = dk::CmdBufMaker{device_}.create();
+            if (slot.luma_texture_id < 0 || slot.chroma_texture_id < 0 || !slot.draw_memory || !slot.draw_commands ||
+                !bindDescriptors(slot.luma_descriptor, slot.chroma_descriptor,
+                                 slot.luma_texture_id, slot.chroma_texture_id)) {
+                immutable_software_descriptors_ = false; break;
+            }
+            slot.draw_commands.addMemory(slot.draw_memory.getMemBlock(), slot.draw_memory.getOffset(), slot.draw_memory.getSize());
+            submitUpdateCommands();
+        }
+        if (!immutable_software_descriptors_) {
+            queue_.waitIdle(); // descriptor writes must finish before returning indices
+            for (auto& slot : software_slots_) {
+                if (slot.luma_texture_id >= 0) video_context_->freeImageIndex(slot.luma_texture_id);
+                if (slot.chroma_texture_id >= 0) video_context_->freeImageIndex(slot.chroma_texture_id);
+                slot.luma_texture_id = slot.chroma_texture_id = -1;
+                if (slot.draw_commands) slot.draw_commands.destroy();
+                slot.draw_memory.destroy();
+            }
+        }
+    }
+    render_stats_.immutable_upload_descriptors = immutable_software_descriptors_;
+    auto record_draw = [&](auto& commands, int luma_id, int chroma_id) {
+        dk::RasterizerState rasterizer;
+        dk::ColorState color;
+        dk::ColorWriteState color_write;
+        commands.clear();
+        commands.clearColor(0, DkColorMask_RGBA, 0.0f, 0.0f, 0.0f, 1.0f);
+        commands.bindShaders(DkStageFlag_GraphicsMask, {vertex_shader_, fragment_shader_});
+        if (!hardware_frames_) {
+            commands.bindTextures(DkStage_Fragment, 0,
+                                         dkMakeTextureHandle(luma_id, 0));
+            commands.bindTextures(DkStage_Fragment, 1,
+                                         dkMakeTextureHandle(chroma_id, 0));
+        }
+        commands.bindUniformBuffer(DkStage_Fragment, 0, transform_buffer_.getGpuAddr(),
+                                          transform_buffer_.getSize());
+        commands.pushConstants(transform_buffer_.getGpuAddr(), transform_buffer_.getSize(),
+                                      0, sizeof(transform), &transform);
+        commands.bindRasterizerState(rasterizer);
+        commands.bindColorState(color);
+        commands.bindColorWriteState(color_write);
+        commands.bindVtxBuffer(0, vertex_buffer_.getGpuAddr(), vertex_buffer_.getSize());
+        commands.bindVtxAttribState(kVertexAttributes);
+        commands.bindVtxBufferState(kVertexBuffers);
+        commands.draw(DkPrimitive_Quads, kQuadVertices.size(), 1, 0, 0);
+        return commands.finishList();
+    };
+    static_cmd_list_ = record_draw(static_cmd_buf_, luma_texture_id_, chroma_texture_id_);
+    if (immutable_software_descriptors_) {
+        for (auto& slot : software_slots_) {
+            slot.draw_list = record_draw(slot.draw_commands, slot.luma_texture_id, slot.chroma_texture_id);
+            if (!slot.draw_list) { immutable_software_descriptors_ = false; break; }
+        }
+    }
+    render_stats_.immutable_upload_descriptors = immutable_software_descriptors_;
     initialized_ = true;
     brls::Logger::info(
         "Deko3D {} renderer initialized {}x{} quality={}",
@@ -332,31 +405,98 @@ void DKVideoRenderer::checkAndInitialize(int width, int height, AVFrame* frame)
         frame_width_, frame_height_, quality_settings.image_quality_mode);
 }
 
-void DKVideoRenderer::bindDescriptors(
-    const dk::ImageDescriptor& luma, const dk::ImageDescriptor& chroma)
+void DKVideoRenderer::beginUpdateCommands()
 {
     update_cmd_buf_.clear();
+    active_update_cmd_slice_ = update_cmd_slice_;
+    const auto fence_begin = monotonic_micros();
+    update_cmd_fences_[active_update_cmd_slice_].wait();
+    const auto fence_wait = monotonic_micros() - fence_begin;
+    render_stats_.command_fence_wait_us_total += fence_wait;
+    render_stats_.command_fence_wait_us_max = std::max(render_stats_.command_fence_wait_us_max, fence_wait);
     update_cmd_buf_.addMemory(
         update_cmd_memory_.getMemBlock(),
-        update_cmd_memory_.getOffset() + update_cmd_slice_ * kUpdateCommandSliceBytes,
+        update_cmd_memory_.getOffset() + active_update_cmd_slice_ * kUpdateCommandSliceBytes,
         kUpdateCommandSliceBytes);
     update_cmd_slice_ = (update_cmd_slice_ + 1) % kUpdateCommandSlices;
-    video_context_->updateImageDescriptor(update_cmd_buf_, luma_texture_id_, luma);
-    video_context_->updateImageDescriptor(update_cmd_buf_, chroma_texture_id_, chroma);
+}
+
+bool DKVideoRenderer::bindDescriptors(
+    const dk::ImageDescriptor& luma, const dk::ImageDescriptor& chroma,
+    int luma_texture_id, int chroma_texture_id)
+{
+    beginUpdateCommands();
+    const bool luma_updated = video_context_->updateImageDescriptor(
+        update_cmd_buf_, luma_texture_id, luma);
+    const bool chroma_updated = video_context_->updateImageDescriptor(
+        update_cmd_buf_, chroma_texture_id, chroma);
+    if (!luma_updated || !chroma_updated) {
+        brls::Logger::error(
+            "Deko3D rejected video descriptor update luma={}/{} chroma={}/{}",
+            luma_texture_id, luma_updated ? 1 : 0,
+            chroma_texture_id, chroma_updated ? 1 : 0);
+        return false;
+    }
+    render_stats_.descriptor_updates += 2;
+    // Descriptor entries are rewritten in GPU memory. Without explicit cache
+    // invalidation the texture units can keep a stale or partially observed
+    // image layout, eventually producing tiled corruption or calcLevelOffset
+    // failures in deko3d.
+    video_context_->invalidateImageDescriptors(update_cmd_buf_);
+    return true;
+}
+
+bool DKVideoRenderer::bindCurrentHardwareTextures()
+{
+    if (current_mapping_ < 0 ||
+        current_mapping_ >= static_cast<int>(frame_mappings_.size())) {
+        return false;
+    }
+    const auto& mapping = frame_mappings_[current_mapping_];
+    if (mapping.luma_texture_id < 0 || mapping.chroma_texture_id < 0)
+        return false;
+    beginUpdateCommands();
+    update_cmd_buf_.bindTextures(
+        DkStage_Fragment, 0, dkMakeTextureHandle(mapping.luma_texture_id, 0));
+    update_cmd_buf_.bindTextures(
+        DkStage_Fragment, 1, dkMakeTextureHandle(mapping.chroma_texture_id, 0));
+    submitUpdateCommands();
+    return true;
+}
+
+void DKVideoRenderer::submitUpdateCommands()
+{
+    // Command memory is a ring. Do not overwrite a slice until Deko3D has
+    // consumed the descriptor/copy commands stored in it.
+    update_cmd_buf_.signalFence(update_cmd_fences_[active_update_cmd_slice_]);
+    queue_.submitCommands(update_cmd_buf_.finishList());
+    ++render_stats_.update_submissions;
 }
 
 bool DKVideoRenderer::updateSoftwareFrame(AVFrame* frame)
 {
+    const auto upload_started = std::chrono::steady_clock::now();
     if (!frame || hardware_frames_ || software_slots_.empty() ||
         !frame->data[0] || !frame->data[1])
         return false;
 
-    auto& slot = software_slots_[software_slot_cursor_];
+    const size_t slot_index = software_slot_cursor_;
+    auto& slot = software_slots_[slot_index];
     software_slot_cursor_ = (software_slot_cursor_ + 1) % software_slots_.size();
+
+    // A transient GPU stall can exceed the four-frame ring and make the CPU
+    // overwrite luma/chroma while the previous draw is still sampling it.
+    const auto slot_fence_begin = monotonic_micros();
+    if (software_slot_submitted_[slot_index])
+        software_slot_fences_[slot_index].wait();
+    const auto slot_wait = monotonic_micros() - slot_fence_begin;
+    render_stats_.slot_fence_wait_us_total += slot_wait;
+    render_stats_.slot_fence_wait_us_max = std::max(render_stats_.slot_fence_wait_us_max, slot_wait);
     auto* luma = static_cast<uint8_t*>(slot.luma_upload.getCpuAddr());
     auto* chroma = static_cast<uint8_t*>(slot.chroma_upload.getCpuAddr());
 
     const int chroma_height = frame_height_ / 2;
+    const auto memcpy_begin = monotonic_micros();
     if (!opennow::video::CopyYuv420ToNv12(
             frame_width_, frame_height_,
             frame->data[0], frame->linesize[0],
@@ -366,7 +506,12 @@ bool DKVideoRenderer::updateSoftwareFrame(AVFrame* frame)
             luma, chroma))
         return false;
 
-    bindDescriptors(slot.luma_descriptor, slot.chroma_descriptor);
+    const auto memcpy_us = monotonic_micros() - memcpy_begin;
+    render_stats_.upload_memcpy_us_total += memcpy_us;
+    render_stats_.upload_memcpy_us_max = std::max(render_stats_.upload_memcpy_us_max, memcpy_us);
+    if (immutable_software_descriptors_) beginUpdateCommands();
+    else if (!bindDescriptors(slot.luma_descriptor, slot.chroma_descriptor,
+                              luma_texture_id_, chroma_texture_id_)) return false;
     dk::ImageView luma_view{slot.luma};
     dk::ImageView chroma_view{slot.chroma};
     update_cmd_buf_.copyBufferToImage(
@@ -377,7 +522,19 @@ bool DKVideoRenderer::updateSoftwareFrame(AVFrame* frame)
         {slot.chroma_upload.getGpuAddr(), 0, 0}, chroma_view,
         {0, 0, 0, static_cast<uint32_t>(frame_width_ / 2),
          static_cast<uint32_t>(chroma_height), 1});
-    queue_.submitCommands(update_cmd_buf_.finishList());
+    // The 2D copies and the following shader sampling use different GPU
+    // caches. Complete both copies and discard cached texture tiles before the
+    // draw command list reads this slot.
+    update_cmd_buf_.barrier(
+        DkBarrier_Full,
+        DkInvalidateFlags_Image | DkInvalidateFlags_Descriptors);
+    submitUpdateCommands();
+    current_software_slot_ = static_cast<int>(slot_index);
+    const uint64_t upload_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - upload_started).count();
+    render_stats_.upload_count++;
+    render_stats_.upload_cpu_us_total += upload_us;
+    render_stats_.upload_cpu_us_max = std::max(render_stats_.upload_cpu_us_max, upload_us);
     return true;
 }
 
@@ -392,7 +549,28 @@ bool DKVideoRenderer::updateFrameMapping(AVFrame* frame, uint64_t generation)
     const uint32_t handle = av_nvtegra_map_get_handle(map);
     void* cpu_address = av_nvtegra_map_get_addr(map);
     const uint32_t size = av_nvtegra_map_get_size(map);
-    const uint32_t chroma_offset = static_cast<uint32_t>(frame->data[1] - frame->data[0]);
+    if (!cpu_address || frame->data[1] <= frame->data[0]) {
+        brls::Logger::error("Deko3D rejected invalid NVTEGRA plane addresses");
+        return false;
+    }
+    const auto chroma_distance = frame->data[1] - frame->data[0];
+    if (chroma_distance <= 0 ||
+        static_cast<uint64_t>(chroma_distance) > UINT32_MAX) {
+        brls::Logger::error("Deko3D rejected invalid NVTEGRA chroma offset {}",
+                            static_cast<long long>(chroma_distance));
+        return false;
+    }
+    const uint32_t chroma_offset = static_cast<uint32_t>(chroma_distance);
+    const uint64_t luma_end = luma_layout_.getSize();
+    const uint64_t chroma_end =
+        static_cast<uint64_t>(chroma_offset) + chroma_layout_.getSize();
+    if (size == 0 || luma_end > size || chroma_offset < luma_end ||
+        chroma_end > size) {
+        brls::Logger::error(
+            "Deko3D rejected NVTEGRA layout size={} lumaEnd={} chromaOffset={} chromaEnd={}",
+            size, luma_end, chroma_offset, chroma_end);
+        return false;
+    }
     int index = -1;
     for (size_t i = 0; i < frame_mappings_.size(); ++i) {
         const auto& candidate = frame_mappings_[i];
@@ -404,26 +582,11 @@ bool DKVideoRenderer::updateFrameMapping(AVFrame* frame, uint64_t generation)
     }
 
     if (index < 0) {
-        constexpr size_t kMappingTarget = 16;
         constexpr size_t kMappingHardLimit = 32;
-        constexpr uint64_t kSafeGenerationAge = 8;
-        while (frame_mappings_.size() >= kMappingTarget) {
-            size_t stale = frame_mappings_.size();
-            for (size_t i = 0; i < frame_mappings_.size(); ++i) {
-                if (static_cast<int>(i) == current_mapping_)
-                    continue;
-                const uint64_t last_used = frame_mappings_[i].last_used_generation;
-                if (generation > last_used && generation - last_used > kSafeGenerationAge) {
-                    stale = i;
-                    break;
-                }
-            }
-            if (stale == frame_mappings_.size())
-                break;
-            frame_mappings_.erase(frame_mappings_.begin() + static_cast<long>(stale));
-            if (current_mapping_ > static_cast<int>(stale))
-                current_mapping_--;
-        }
+        // Imported NVDEC mappings are few (14 in the captured 54-minute
+        // session). Keep them for the renderer lifetime. Erasing by generation
+        // age can destroy a Deko3D memory object that an in-flight draw still
+        // references.
         if (frame_mappings_.size() >= kMappingHardLimit) {
             brls::Logger::error("Deko3D mapping cache exhausted; retaining previous good frame");
             return false;
@@ -443,17 +606,36 @@ bool DKVideoRenderer::updateFrameMapping(AVFrame* frame, uint64_t generation)
         mapping.chroma.initialize(chroma_layout_, mapping.memory, chroma_offset);
         mapping.luma_descriptor.initialize(mapping.luma);
         mapping.chroma_descriptor.initialize(mapping.chroma);
+        mapping.luma_texture_id = video_context_->allocateImageIndex();
+        mapping.chroma_texture_id = video_context_->allocateImageIndex();
+        if (mapping.luma_texture_id < 0 || mapping.chroma_texture_id < 0) {
+            brls::Logger::error(
+                "Deko3D mapping descriptor allocation failed luma={} chroma={}",
+                mapping.luma_texture_id, mapping.chroma_texture_id);
+            if (mapping.luma_texture_id >= 0)
+                video_context_->freeImageIndex(mapping.luma_texture_id);
+            if (mapping.chroma_texture_id >= 0)
+                video_context_->freeImageIndex(mapping.chroma_texture_id);
+            return false;
+        }
+        if (!bindDescriptors(mapping.luma_descriptor, mapping.chroma_descriptor,
+                             mapping.luma_texture_id,
+                             mapping.chroma_texture_id)) {
+            video_context_->freeImageIndex(mapping.luma_texture_id);
+            video_context_->freeImageIndex(mapping.chroma_texture_id);
+            return false;
+        }
+        submitUpdateCommands();
         frame_mappings_.emplace_back(std::move(mapping));
         index = static_cast<int>(frame_mappings_.size()) - 1;
     }
 
     frame_mappings_[index].last_used_generation = generation;
 
-    if (index == current_mapping_)
-        return true;
-    auto& active = frame_mappings_[index];
-    bindDescriptors(active.luma_descriptor, active.chroma_descriptor);
-    queue_.submitCommands(update_cmd_buf_.finishList());
+    // Every imported NVDEC allocation owns immutable descriptor slots. Only the
+    // lightweight texture handles change from frame to frame; the shared NanoVG
+    // descriptor entries are never rewritten while a previous draw can sample
+    // them.
     current_mapping_ = index;
     return true;
 }
@@ -472,6 +654,10 @@ void DKVideoRenderer::drawLatest(NVGcontext* vg, int width, int height, AVFrame*
     checkAndInitialize(width, height, frame);
     if (!initialized_)
         return;
+    // Also protect callers outside WebRtcSession from stale copy extents.
+    if (!frame || frame->width != frame_width_ || frame->height != frame_height_ ||
+        (frame->format == AV_PIX_FMT_NVTEGRA) != hardware_frames_)
+        return;
     if (generation != rendered_generation_) {
         const bool updated = hardware_frames_
             ? updateFrameMapping(frame, generation)
@@ -482,8 +668,23 @@ void DKVideoRenderer::drawLatest(NVGcontext* vg, int width, int height, AVFrame*
             retainSubmittedFrame(frame);
         rendered_generation_ = generation;
     }
-    if (static_cmd_list_)
-        queue_.submitCommands(static_cmd_list_);
+    DkCmdList draw_list = static_cmd_list_;
+    if (immutable_software_descriptors_ && current_software_slot_ >= 0)
+        draw_list = software_slots_[static_cast<size_t>(current_software_slot_)].draw_list;
+    if (draw_list) {
+        if (hardware_frames_ && !bindCurrentHardwareTextures())
+            return;
+        queue_.submitCommands(draw_list);
+        if (hardware_frames_ && !submitted_frames_.empty()) {
+            auto& submitted = submitted_frames_.back();
+            queue_.signalFence(submitted.fence, false);
+            submitted.fence_submitted = true;
+        } else if (current_software_slot_ >= 0) {
+            const size_t slot_index = static_cast<size_t>(current_software_slot_);
+            video_context_->queueSignalFence(&software_slot_fences_[slot_index]);
+            software_slot_submitted_[slot_index] = true;
+        }
+    }
     if (render_stats_.rendered_frames == 0)
         render_stats_.measurement_start_timestamp = started;
     render_stats_.total_render_time += monotonic_millis() - started;

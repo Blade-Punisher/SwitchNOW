@@ -25,6 +25,7 @@ limitations under the License.
 #include <deko3d.hpp>
 #include <nanovg/dk_renderer.hpp>
 #include <optional>
+#include <functional>
 
 typedef Event _LibNXEvent; // "Event" alone clashes with brls::Event
 
@@ -58,6 +59,9 @@ class SwitchVideoContext : public VideoContext
 
     dk::Image* getFramebuffer();
 
+    // One UI-thread callback after rendering, while the acquired image is ours.
+    void captureNextFrame(std::function<void()> callback) { frameCapture = std::move(callback); }
+
     int allocateImageIndex();
     bool freeImageIndex(int index);
     bool updateImageDescriptor(dk::CmdBuf cmdbuf, int index, dk::ImageDescriptor const& descriptor);
@@ -70,6 +74,7 @@ class SwitchVideoContext : public VideoContext
     void queueFlush();
 
   private:
+    std::function<void()> frameCapture;
     _LibNXEvent defaultDisplayResolutionChangeEvent;
     bool displayResolutionChangeEventReady = true;
 

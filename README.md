@@ -4,6 +4,8 @@
 
 # SwitchNOW
 
+Developed and maintained by **Blade-Punisher**.
+
 SwitchNOW is a native Nintendo Switch homebrew client for GeForce NOW. It is
 distributed as an `.nro` and combines a controller-first Borealis launcher with
 native WebRTC signaling, H.264 video, Opus audio and low-latency input delivery.
@@ -30,8 +32,7 @@ native WebRTC signaling, H.264 video, Opus audio and low-latency input delivery.
 - Synchronized Opus audio with configurable buffering and volume amplification.
 - Xbox-compatible virtual gamepad, optional Switch-labelled face-button layout,
   touch-to-mouse input and an in-stream Nintendo keyboard.
-- Adaptive stream-quality modes for motion resilience, clarity or untouched
-  server output.
+- Performance, Balanced and Quality modes with bounded local adaptation.
 - Free-tier session warnings and automatic return to the game page after a
   session ends or the connection is lost.
 - Opt-in flight-recorder diagnostics. Detailed logs and overlays are disabled
@@ -50,7 +51,7 @@ native WebRTC signaling, H.264 video, Opus audio and low-latency input delivery.
 | Video decoder | Tegra X1 NVDEC, software FFmpeg fallback, automatic safe mode |
 | Stream presets | Safe: 720p30 at 8 Mbps; Balanced: 720p60 at 12 Mbps; Quality: 1080p60 at 20 Mbps |
 | Custom bitrate steps | 8, 12, 16, 20 or 25 Mbps |
-| Quality modes | Adaptive, Clarity and Original |
+| Quality modes | Performance, Balanced and Quality |
 | Audio | Opus, 30-100 ms configurable buffer, 8x-16x gain options |
 | Input | Xbox-compatible gamepad reports, relative mouse and keyboard over the stream data channel |
 | Interface languages | English, Simplified Chinese, Spanish, Russian, Italian, French, Polish and Ukrainian |
@@ -59,15 +60,20 @@ native WebRTC signaling, H.264 video, Opus audio and low-latency input delivery.
 
 ### Video quality modes
 
-- **Adaptive** is the recommended default. It balances minimum and initial
-  bitrate, packet-loss resilience, light denoising and restrained sharpening.
-- **Clarity** prioritizes a cleaner image and stronger detail recovery while
-  retaining the same maximum bitrate selected in settings.
-- **Original** disables the local image-enhancement pass and keeps the decoded
-  server image as-is.
+- **Performance** uses shorter frame waits and no local enhancement pass.
+- **Balanced** is the default, based on Motion, with restrained filtering and bounded adaptive waits.
+- **Quality** retains more frame-wait tolerance and light detail enhancement.
 
-`Auto` selects NVDEC first and falls back to software decoding if hardware
-initialization fails or the previous hardware session did not shut down cleanly.
+All modes distinguish damaged delivery, slow arrivals and decoder pressure. Resolution,
+FPS and bitrate remain independent. Server bitrate parameters are negotiated at launch;
+this build does not claim to change the server encoder bitrate during a session.
+Legacy Adaptive/Motion migrate to Balanced, Clarity to Quality, Original to Performance.
+
+`Auto` decodes with NVDEC and copies each finished frame into renderer-owned YUV
+textures, avoiding the unstable cross-engine zero-copy surface path. It falls back
+to software decoding if hardware initialization fails or the previous hardware
+session did not shut down cleanly. The explicit `NVDEC` option keeps zero-copy for
+diagnostic testing.
 The app avoids building an unlimited frame backlog: on congestion it drops stale
 work, requests a clean reference frame and resumes from the newest valid image.
 
@@ -177,7 +183,7 @@ build/switch/SwitchNOW.nro
 Create a conventional release archive:
 
 ```powershell
-.\scripts\package-release.ps1 -Version 1.1.7
+.\scripts\package-release.ps1 -Version 1.3.0
 ```
 
 ## Source layout
@@ -196,7 +202,7 @@ build-switch.ps1          Windows build entry point
 
 The repository contains no accounts, passwords, tokens, logs or device data.
 Saved credentials are created only at runtime on the user's SD card. Password
-storage is optional and uses the encrypted local credential vault.
+storage for GFN accounts is optional and uses the encrypted local credential vault. Game/Epic auto-login profiles are optional plain-text files on SD; protect the card accordingly.
 
 ## Support SwitchNOW
 
@@ -214,9 +220,7 @@ warranty.
 
 ## Projects and acknowledgements
 
-SwitchNOW would not exist without the following open-source projects. Reference
-projects inspired the architecture and user experience; they are not copied into
-or linked directly with the SwitchNOW binary.
+SwitchNOW would not exist without the following open-source projects. Reference projects informed the architecture and user experience. Selected adaptations from OpenNOW-Switch are acknowledged in THIRD_PARTY_NOTICES.md.
 
 ### Architecture and UX references
 

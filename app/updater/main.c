@@ -8,11 +8,14 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/stat.h>
+#include "update_target.h"
+#include "update_install.h"
 
-static const char* Target = "sdmc:/switch/SwitchNOW/SwitchNOW.nro";
-static const char* Staged = "sdmc:/switch/SwitchNOW/SwitchNOW.nro.update";
-static const char* Marker = "sdmc:/switch/SwitchNOW/SwitchNOW.nro.update.sha256";
-static const char* Backup = "sdmc:/switch/SwitchNOW/SwitchNOW.nro.previous";
+static char Target[UPDATE_TARGET_CAPACITY];
+static char Staged[UPDATE_TARGET_CAPACITY];
+static char Marker[UPDATE_TARGET_CAPACITY];
+static char Backup[UPDATE_TARGET_CAPACITY];
 static const char* LogPath = "sdmc:/switch/SwitchNOW/update.log";
 
 static void write_log(const char* format, ...)
@@ -84,38 +87,35 @@ static bool verified(const char* path)
     return read_expected(expected) && checksum_file(path, actual) && strcmp(expected, actual) == 0;
 }
 
+static bool commit_sd(void) { return R_SUCCEEDED(fsdevCommitDevice("sdmc")); }
+static bool exists_file(const char* path) {
+    struct stat info;
+    return stat(path, &info) == 0 && S_ISREG(info.st_mode);
+}
+
 int main(int argc, char** argv)
 {
-    const bool requested = argc > 1 && argv[1] && strcmp(argv[1], "--finish-update") == 0;
+    const bool requested = argc == 3 && argv[1] && strcmp(argv[1], "--finish-update") == 0 &&
+        update_target_valid(argv[2]);
     write_log("[helper] start requested=%d\n", requested ? 1 : 0);
-    if (!requested || !verified(Staged))
+    if (!requested) return 0;
+    snprintf(Target, sizeof(Target), "%s", argv[2]);
+    // Derive sidecar paths from the validated source rather than independently
+    // accepting a target/stage pair from the command line.
+    snprintf(Staged, sizeof(Staged), "%s.update", argv[2]);
+    snprintf(Marker, sizeof(Marker), "%s.update.sha256", argv[2]);
+    snprintf(Backup, sizeof(Backup), "%s.previous", argv[2]);
+    write_log("[helper] target=%s\n", Target);
+    const UpdateFileOps ops = {rename, unlink, verified, commit_sd, exists_file};
+    const UpdateInstallResult result = update_install(Target, Staged, Backup, &ops);
+    if (result != UPDATE_INSTALLED)
     {
-        write_log("[helper] staged file verification failed\n");
+        write_log("[helper] install failed result=%d errno=%d backup=%s\n", result, errno, Backup);
         return 0;
     }
-    unlink(Backup);
-    if (rename(Target, Backup) != 0)
-    {
-        write_log("[helper] backup failed errno=%d\n", errno);
-        return 0;
-    }
-    if (rename(Staged, Target) != 0 || !verified(Target))
-    {
-        const int saved = errno;
-        unlink(Target);
-        rename(Backup, Target);
-        fsdevCommitDevice("sdmc");
-        write_log("[helper] install failed errno=%d; rolled back\n", saved);
-        return 0;
-    }
-    if (R_FAILED(fsdevCommitDevice("sdmc")))
-    {
-        unlink(Target);
-        rename(Backup, Target);
-        fsdevCommitDevice("sdmc");
-        write_log("[helper] commit failed; rolled back\n");
-        return 0;
-    }
-    write_log("[helper] update installed; returning to HOME\n");
+    write_log("[helper] update installed; restarting %s\n", Target);
+    char arguments[UPDATE_TARGET_CAPACITY + 2];
+    snprintf(arguments, sizeof(arguments), "\"%s\"", Target);
+    envSetNextLoad(Target, arguments);
     return 0;
 }

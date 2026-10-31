@@ -1,59 +1,204 @@
-std::vector<GameInfo> GfnClient::FetchLibraryGames(AuthSession& session) const
+void GfnClient::MarkGameOwned(AuthSession& session,const std::string& app_id,const std::string& variant_id) const
+{ SetGameOwnership(session,app_id,variant_id,true); }
+void GfnClient::MarkGameUnowned(AuthSession& session,const std::string& app_id,const std::string& variant_id) const
+{ SetGameOwnership(session,app_id,variant_id,false); }
+
+void GfnClient::SetGameOwnership(AuthSession& session,const std::string& app_id,const std::string& variant_id,bool owned) const
 {
-    session = RecoverSavedSession(session);
-    std::string jwt_token = ResolveSessionJwt(session);
-    const std::string vpc_id    = ResolveVpcId(http_client_, session);
+    const auto body=gfn::ownership::RequestBody(variant_id,owned);
+    if(app_id.empty())throw std::runtime_error("Game ID is unavailable. Refresh the catalog.");
+    const auto identity=game_feed::OwnerKey(session.user.user_id,session.provider.code,session.provider.streaming_service_url);
+    if(identity.empty())throw std::runtime_error("Sign in to GFN before adding games to your library.");
+    session=RecoverSavedSession(session);
+    auto fetch=[&]{
+        if(identity!=game_feed::OwnerKey(session.user.user_id,session.provider.code,session.provider.streaming_service_url))
+            throw std::runtime_error("GFN account changed. Reopen the game card and try again.");
+        return http_client_.Request("POST",kGraphQlEndpoint,kUserAgent,
+        BuildGraphQlPostHeaders(ResolveSessionJwt(session)),body,5,20,512*1024);};
+    auto response=fetch();
+    if(response.status_code==401){session=RecoverSavedSession(session,true);response=fetch();}
+    if(response.status_code!=200)throw std::runtime_error("GFN ownership request failed with HTTP "+std::to_string(response.status_code));
+    gfn::ownership::ValidateResponse(response.body,app_id,owned);
+    // Only an acknowledged mutation invalidates browse data; timed-out writes
+    // are not blindly retried and never become optimistic ownership.
+    gfn::feed::InvalidateAccount("sdmc:/switch/SwitchNOW",identity);
+    AppendAuthLog(owned?"library: add_owned_variant confirmed":"library: remove_owned_variant confirmed");
+}
 
-    HttpResponse response = http_client_.Get(
-        BuildLibraryUrl(vpc_id, true),
-        kUserAgent,
-        BuildGraphQlHeaders(jwt_token));
-
-    if (response.status_code == 401)
-    {
-        session = RecoverSavedSession(session, true);
-        jwt_token = ResolveSessionJwt(session);
-        response = http_client_.Get(
-            BuildLibraryUrl(vpc_id, true),
-            kUserAgent,
-            BuildGraphQlHeaders(jwt_token));
+std::vector<GameInfo> GfnClient::FetchLibraryGames(AuthSession& session, bool* complete,
+    const std::function<void(std::vector<GameInfo>, bool)>& snapshot, bool force_full) const
+{
+    const auto revision=game_feed::Revision();
+    const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(90);
+    if (complete) *complete = false;
+    constexpr const char* directory = "sdmc:/switch/SwitchNOW";
+    const std::string original_user = session.user.user_id;
+    const std::string owner = game_feed::ScopeKey("library", game_feed::OwnerKey(original_user, session.provider.code, session.provider.streaming_service_url));
+    auto cached = gfn::feed::LoadCache(directory, owner);
+    auto publish = [&](std::vector<GameInfo> games, bool full) {
+        ApplyPlayHistory(games, LoadPlayHistory());
+        if (snapshot) snapshot(std::move(games), full);
+    };
+    if (cached) {
+        publish(cached->games, true);
+        AppendAuthLog("library: disk_snapshot games=" + std::to_string(cached->games.size()));
     }
-
-    if (response.status_code != 200)
-    {
-        response = http_client_.Get(
-            BuildLibraryUrl(vpc_id, false),
-            kUserAgent,
-            BuildGraphQlHeaders(jwt_token));
+    game_feed::LaunchGate gate;
+    auto yield_to_launch = [&] { return gate.Check(network::launch_count.load() != 0); };
+    try {
+        HttpCancellationScope launch_priority([&]{return yield_to_launch() || std::chrono::steady_clock::now()>=deadline;});
+        if (yield_to_launch()) throw game_feed::Deferred();
+        const auto now = static_cast<std::int64_t>(NowMs());
+        if (cached && !force_full && game_feed::Fresh(cached->updated_at_ms, now, game_feed::kPanelAgeMs) &&
+            !game_feed::ScanRequired(false, true, cached->scanned_at_ms, now)) {
+            if (complete) *complete = true;
+            ApplyPlayHistory(cached->games, LoadPlayHistory());
+            return std::move(cached->games);
+        }
+        session = RecoverSavedSession(session);
+        std::string jwt_token = ResolveSessionJwt(session);
+        const std::string vpc_id = ResolveVpcId(http_client_, session);
+        std::vector<GameInfo> panel;
+        bool panel_ok = false;
+        try {
+            auto response = http_client_.Get(BuildLibraryUrl(vpc_id, true), kUserAgent, BuildGraphQlHeaders(jwt_token),3,10,4*1024*1024);
+            if (response.status_code == 401) {
+                session = RecoverSavedSession(session, true);
+                jwt_token = ResolveSessionJwt(session);
+                response = http_client_.Get(BuildLibraryUrl(vpc_id, true), kUserAgent, BuildGraphQlHeaders(jwt_token),3,10,4*1024*1024);
+            }
+            if (response.status_code != 200)
+                response = http_client_.Get(BuildLibraryUrl(vpc_id, false), kUserAgent, BuildGraphQlHeaders(jwt_token),3,10,4*1024*1024);
+            if (response.status_code != 200)
+                throw std::runtime_error("Library panel HTTP " + std::to_string(response.status_code));
+            auto root = LoadJson(response.body);
+            panel = ParseLibraryGames(root); panel_ok = true;
+            if (!cached && !panel.empty()) publish(panel, false); // first cards before full scan/metadata
+        } catch (const std::exception&) {
+            if (yield_to_launch()) throw game_feed::Deferred();
+            AppendAuthLog("library: panel unavailable; preserving snapshot or enumerating catalog");
+        }
+        auto merge = [](std::vector<GameInfo>& games, const std::vector<GameInfo>& incoming) {
+            std::unordered_map<std::string, size_t> by_id;
+            for (size_t i = 0; i < games.size(); ++i) by_id[games[i].id] = i;
+            for (const auto& game : incoming) {
+                auto found = by_id.find(game.id);
+                if (found == by_id.end()) { by_id.emplace(game.id, games.size()); games.push_back(game); }
+                else MergeGame(games[found->second], game);
+            }
+        };
+        auto enrich_missing = [&](std::vector<GameInfo>& games) {
+            std::vector<GameInfo> missing;
+            for(const auto& game:games)if(game_feed::NeedsLibraryMetadata(game))missing.push_back(game);
+            if(missing.empty())return;
+            const auto metadata_deadline=std::min(deadline,std::chrono::steady_clock::now()+std::chrono::seconds(15));
+            try {
+                HttpCancellationScope budget([&]{return std::chrono::steady_clock::now()>=metadata_deadline;});
+                EnrichGamesWithMetadata(http_client_,jwt_token,vpc_id,missing);
+            } catch(...) {if(yield_to_launch())throw game_feed::Deferred();}
+            merge(games,missing); // Keep successfully enriched chunks on timeout.
+        };
+        const auto scan_required = game_feed::ScanRequired(force_full, cached.has_value(),
+            cached ? cached->scanned_at_ms : 0, now);
+        if (!scan_required && panel_ok) {
+            auto games = cached->games;
+            merge(games,panel);
+            publish(games,true); // Existing full membership stays usable during detail refresh.
+            enrich_missing(games);
+            if (yield_to_launch()) throw game_feed::Deferred();
+            if (session.user.user_id == original_user) {
+                EnsureAppHome();
+                gfn::feed::SaveCache(directory, owner, {games, cached->scanned_at_ms, static_cast<std::int64_t>(NowMs())},revision);
+            }
+            if (complete) *complete = true;
+            ApplyPlayHistory(games, LoadPlayHistory());
+            AppendAuthLog("library: cached_complete panel_refresh full_scan=skipped games=" + std::to_string(games.size()));
+            return games;
+        }
+        // A failed panel check cannot turn an old snapshot into a fresh one.
+        if (!scan_required && !panel_ok) {
+            ApplyPlayHistory(cached->games, LoadPlayHistory());
+            return std::move(cached->games);
+        }
+        std::vector<GameInfo> provisional = panel;
+        size_t published_owned = 0;
+        const auto operation = BeginRuntimeOperation("catalog", "library_complete", "panel_games=" + std::to_string(panel.size()));
+        try {
+            HttpCancellationScope cancellation([&] { return yield_to_launch() || std::chrono::steady_clock::now() >= deadline; });
+            bool auth_refreshed = false;
+            const auto result = gfn::library::Scan([&](const std::string& cursor) {
+                auto fetch = [&] {
+                    return http_client_.Request("POST", kGraphQlEndpoint, kUserAgent,
+                        BuildGraphQlPostHeaders(jwt_token), gfn::library::RequestBody(vpc_id, cursor),
+                        3, 10, 4 * 1024 * 1024);
+                };
+                auto response = fetch();
+                if (response.status_code == 401 && !auth_refreshed) {
+                    auth_refreshed = true; session = RecoverSavedSession(session, true);
+                    jwt_token = ResolveSessionJwt(session); response = fetch();
+                }
+                if (response.status_code != 200)
+                    throw std::runtime_error("Library catalog HTTP " + std::to_string(response.status_code));
+                return response.body;
+            }, [&](const gfn::library::ScanResult& progress) {
+                if (cached || progress.owned_apps.empty() ||
+                    (published_owned != 0 && progress.owned_apps.size() < published_owned + 15)) return;
+                if (yield_to_launch()) throw game_feed::Deferred();
+                auto preview = panel;
+                std::vector<GameInfo> owned;
+                for (const auto& app : progress.owned_apps) {
+                    auto root = LoadJson(app); auto game = ParseApp(root.get());
+                    if (!game.id.empty() && !game.title.empty()) owned.push_back(std::move(game));
+                }
+                merge(preview, owned);
+                provisional = preview; published_owned = progress.owned_apps.size();
+                AppendAuthLog("library: scan_preview pages=" + std::to_string(progress.pages) +
+                    " owned=" + std::to_string(published_owned));
+                publish(std::move(preview), false);
+            });
+            std::vector<GameInfo> games = panel, owned;
+            for (const auto& app : result.owned_apps) {
+                auto root = LoadJson(app); auto game = ParseApp(root.get());
+                if (!game.id.empty() && !game.title.empty()) owned.push_back(std::move(game));
+            }
+            merge(games, owned);
+            if(cached)game_feed::ReuseLibraryMetadata(games,cached->games);
+            // Enumeration establishes complete membership. Publish/cache it before
+            // optional descriptions/screenshots, so launch cancellation cannot
+            // discard a completed scan and force the next launch to start over.
+            if(yield_to_launch())throw game_feed::Deferred();
+            const auto scanned_at=static_cast<std::int64_t>(NowMs());
+            if(session.user.user_id==original_user) {
+                EnsureAppHome();
+                gfn::feed::SaveCache(directory,owner,{games,scanned_at,scanned_at},revision);
+            }
+            publish(games,true);
+            AppendAuthLog("library: membership_ready games="+std::to_string(games.size()));
+            enrich_missing(games);
+            if (yield_to_launch()) throw game_feed::Deferred();
+            const auto refreshed_at = static_cast<std::int64_t>(NowMs());
+            if (session.user.user_id == original_user) {
+                EnsureAppHome();
+                if (!gfn::feed::SaveCache(directory, owner, {games, refreshed_at, refreshed_at},revision))
+                    AppendAuthLog("library: cache_write_unavailable");
+            }
+            if (complete) *complete = true;
+            EndRuntimeOperation(operation, "catalog", "library_complete", "ok",
+                "pages=" + std::to_string(result.pages) + " scanned=" + std::to_string(result.scanned) +
+                " owned=" + std::to_string(result.owned_apps.size()) + " merged=" + std::to_string(games.size()));
+            ApplyPlayHistory(games, LoadPlayHistory()); return games;
+        } catch (const std::exception& error) {
+            EndRuntimeOperation(operation, "catalog", "library_complete", gate.deferred() ? "deferred" : "partial", error.what());
+            if (yield_to_launch()) throw game_feed::Deferred();
+            if (cached) { ApplyPlayHistory(cached->games, LoadPlayHistory()); return std::move(cached->games); }
+            if (!provisional.empty()) { ApplyPlayHistory(provisional, LoadPlayHistory()); return provisional; }
+            if (!panel_ok) throw;
+        }
+        ApplyPlayHistory(panel, LoadPlayHistory()); return panel;
+    } catch (...) {
+        if (yield_to_launch()) throw game_feed::Deferred();
+        throw;
     }
-
-    if (response.status_code != 200)
-    {
-        throw std::runtime_error(
-            "Library fetch failed with HTTP " + std::to_string(response.status_code));
-    }
-
-    JsonPtr root = LoadJson(response.body);
-    std::vector<GameInfo> games = ParseLibraryGames(root);
-    const std::uint64_t metadata_operation = BeginRuntimeOperation(
-        "catalog", "library_metadata",
-        "games=" + std::to_string(games.size()));
-    try
-    {
-        EnrichGamesWithMetadata(
-            http_client_, jwt_token, vpc_id, games);
-        EndRuntimeOperation(
-            metadata_operation, "catalog", "library_metadata", "ok",
-            "games=" + std::to_string(games.size()));
-    }
-    catch (const std::exception& error)
-    {
-        EndRuntimeOperation(
-            metadata_operation, "catalog", "library_metadata", "fallback",
-            error.what());
-    }
-    ApplyPlayHistory(games, LoadPlayHistory());
-    return games;
 }
 
 bool GfnClient::LoadSavedSession(AuthSession& session) const
@@ -297,145 +442,15 @@ void GfnClient::SaveLauncherPreference(
     return hex.substr(0, 8) + "-" + hex.substr(8, 4) + "-" + hex.substr(12, 4) + "-" + hex.substr(16, 4) + "-" + hex.substr(20);
 }
 
-static std::string BuildSessionBody(
-    const std::string& app_id,
-    const std::string& internal_title,
-    const std::string& device_id,
-    const StreamSettings& stream_settings)
-{
-    json_t* root = json_object();
-    json_t* req = json_object();
-    try {
-        json_object_set_new(req, "appId", json_integer(std::stoll(app_id)));
-    } catch (...) {
-        json_object_set_new(req, "appId", json_integer(0));
-    }
-    json_object_set_new(req, "cmsId", json_string(app_id.c_str()));
-    if (internal_title.empty())
-        json_object_set_new(req, "internalTitle", json_null());
-    else
-        json_object_set_new(req, "internalTitle", json_string(internal_title.c_str()));
-    json_object_set_new(req, "networkTestSessionId", json_null());
-    json_object_set_new(req, "parentSessionId", json_null());
-    json_object_set_new(req, "clientIdentification", json_string("GFN-PC"));
-    json_object_set_new(req, "deviceHashId", json_string(device_id.c_str()));
-    json_object_set_new(req, "clientVersion", json_string("30.0"));
-    json_object_set_new(req, "clientPlatformName", json_string("windows"));
-
-    json_object_set_new(req, "availableSupportedControllers", json_array());
-    json_object_set_new(req, "sdkVersion", json_string("1.0"));
-    json_object_set_new(req, "streamerVersion", json_integer(1));
-    json_object_set_new(req, "useOps", json_true());
-    json_object_set_new(req, "audioMode", json_integer(2));
-    json_object_set_new(req, "sdrHdrMode", json_integer(0));
-    json_object_set_new(req, "clientDisplayHdrCapabilities", json_null());
-    json_object_set_new(req, "surroundAudioInfo", json_integer(0));
-    // Reserve player 1 for the virtual XInput controller exposed by the
-    // Switch stream view. The gamepad reports use the same active bitmap.
-    json_object_set_new(req, "remoteControllersBitmap", json_integer(1));
-    json_object_set_new(req, "enhancedStreamMode", json_integer(1));
-    json_object_set_new(req, "appLaunchMode", json_integer(1));
-    json_object_set_new(req, "secureRTSPSupported", json_false());
-    json_object_set_new(req, "partnerCustomData", json_string(""));
-    json_object_set_new(req, "accountLinked", json_true());
-    json_object_set_new(
-        req, "enablePersistingInGameSettings",
-        json_boolean(stream_settings.persist_game_settings));
-    json_object_set_new(req, "userAge", json_integer(26));
-    json_object_set_new(req, "clientTimezoneOffset", json_integer(0));
-    
-    json_t* features = json_object();
-    json_object_set_new(features, "reflex", json_false());
-    // CloudMatch uses an enum here: 0 = 8-bit SDR, 10 = 10-bit capable.
-    // Sending literal 8 makes the whole launch request fail with a generic
-    // INTERNAL_ERROR_STATUS before the session can enter queue/setup.
-    json_object_set_new(features, "bitDepth", json_integer(0));
-    json_object_set_new(features, "cloudGsync", json_false());
-    json_object_set_new(features, "enabledL4S", json_false());
-    json_object_set_new(features, "mouseMovementFlags", json_integer(0));
-    json_object_set_new(features, "trueHdr", json_false());
-    json_object_set_new(features, "supportedHidDevices", json_integer(0));
-    json_object_set_new(features, "profile", json_integer(0));
-    json_object_set_new(features, "fallbackToLogicalResolution", json_false());
-    json_object_set_new(features, "hidDevices", json_null());
-    json_object_set_new(features, "chromaFormat", json_integer(0));
-    json_object_set_new(features, "prefilterMode", json_integer(0));
-    json_object_set_new(features, "prefilterSharpness", json_integer(0));
-    json_object_set_new(features, "prefilterNoiseReduction", json_integer(0));
-    json_object_set_new(features, "hudStreamingMode", json_integer(0));
-    json_object_set_new(features, "sdrColorSpace", json_integer(2));
-    json_object_set_new(features, "hdrColorSpace", json_integer(0));
-    json_object_set_new(req, "requestedStreamingFeatures", features);
-
-    json_t* meta = json_array();
-    json_t* m1 = json_object(); json_object_set_new(m1, "key", json_string("SubSessionId")); json_object_set_new(m1, "value", json_string(device_id.c_str())); json_array_append_new(meta, m1);
-    json_t* m2 = json_object(); json_object_set_new(m2, "key", json_string("wssignaling")); json_object_set_new(m2, "value", json_string("1")); json_array_append_new(meta, m2);
-    json_t* m3 = json_object(); json_object_set_new(m3, "key", json_string("GSStreamerType")); json_object_set_new(m3, "value", json_string("WebRTC")); json_array_append_new(meta, m3);
-    json_object_set_new(req, "metaData", meta);
-
-    json_t* monitors = json_array();
-    json_t* monitor = json_object();
-    json_object_set_new(monitor, "monitorId", json_integer(0));
-    json_object_set_new(monitor, "positionX", json_integer(0));
-    json_object_set_new(monitor, "positionY", json_integer(0));
-    json_object_set_new(monitor, "widthInPixels", json_integer(stream_settings.width));
-    json_object_set_new(monitor, "heightInPixels", json_integer(stream_settings.height));
-    json_object_set_new(monitor, "framesPerSecond", json_integer(stream_settings.fps));
-    json_object_set_new(monitor, "sdrHdrMode", json_integer(0));
-    json_object_set_new(monitor, "displayData", json_null());
-    json_object_set_new(monitor, "hdr10PlusGamingData", json_null());
-    json_object_set_new(monitor, "dpi", json_integer(100));
-    json_array_append_new(monitors, monitor);
-    json_object_set_new(req, "clientRequestMonitorSettings", monitors);
-
-    json_object_set_new(root, "sessionRequestData", req);
-
-    char* dump = json_dumps(root, 0);
-    std::string body(dump);
-    free(dump);
-    json_decref(root);
-    return body;
-}
-
-int ParseSessionStatus(json_t* status)
-{
-    if (json_is_integer(status))
-        return static_cast<int>(json_integer_value(status));
-
-    if (!json_is_string(status))
-        return -1;
-
-    const std::string value = Lowercase(JsonString(status));
-    if (value == "queued")
-        return 0;
-
-    if (value == "provisioning" || value == "initializing" || value == "setup" ||
-        value == "setting_up" || value == "launching" || value == "launching_game")
-        return 1;
-
-    if (value == "active" || value == "ready" || value == "paused")
-        return 2;
-
-    if (value == "streaming" || value == "playing" || value == "connected")
-        return 3;
-
-    if (value.find("ad") != std::string::npos)
-        return 6;
-
-    if (value.find("fail") != std::string::npos || value.find("error") != std::string::npos ||
-        value.find("closed") != std::string::npos || value.find("terminated") != std::string::npos ||
-        value.find("cancel") != std::string::npos)
-        return 4;
-
-    return -1;
-}
-
 std::string SessionInfoTraceSummary(const SessionInfo& info)
 {
     std::ostringstream out;
     out << "sessionId=" << info.session_id
         << " status=" << info.status
         << " queuePosition=" << info.queue_position
+        << " queueSource=" << info.queue_source
+        << " queueConflict=" << (info.queue_conflict ? 1 : 0)
+        << " seatSetupStep=" << info.seat_setup_step
         << " appPatching=" << (info.app_patching ? 1 : 0)
         << " serverIp=" << info.server_ip
         << " requestedRegion=" << info.requested_region_url

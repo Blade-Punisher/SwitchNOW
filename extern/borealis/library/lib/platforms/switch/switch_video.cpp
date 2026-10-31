@@ -229,6 +229,12 @@ void SwitchVideoContext::beginFrame()
 
 void SwitchVideoContext::endFrame()
 {
+    if (frameCapture)
+    {
+        auto capture = std::move(frameCapture);
+        frameCapture = {};
+        capture();
+    }
     // Now that we are done rendering, present it to the screen
     queue.presentImage(this->swapchain, this->imageSlot);
 }

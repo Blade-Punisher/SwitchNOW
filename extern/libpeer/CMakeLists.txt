@@ -79,9 +79,19 @@ ExternalProject_Add(cjson
     -DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}
 )
 
+# MSYS CMake can pass POSIX paths while GCC's __FILE__ uses a drive path.
+# Cover both spellings without embedding the developer's source directory.
+set(_SWITCHNOW_SOURCE_PREFIX "${CMAKE_SOURCE_DIR}")
+if(_SWITCHNOW_SOURCE_PREFIX MATCHES "^/([a-zA-Z])/(.*)$")
+  set(_SWITCHNOW_SOURCE_TAIL "${CMAKE_MATCH_2}")
+  string(TOUPPER "${CMAKE_MATCH_1}" _SWITCHNOW_SOURCE_DRIVE)
+  set(_SWITCHNOW_SOURCE_PREFIX "${_SWITCHNOW_SOURCE_DRIVE}:/${_SWITCHNOW_SOURCE_TAIL}")
+endif()
+
 ExternalProject_Add(mbedtls
   SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/mbedtls
   CMAKE_ARGS
+    "-DCMAKE_C_FLAGS:STRING=${CMAKE_C_FLAGS} \"-ffile-prefix-map=${CMAKE_SOURCE_DIR}=.\" \"-ffile-prefix-map=${_SWITCHNOW_SOURCE_PREFIX}=.\""
     -DCMAKE_POLICY_VERSION_MINIMUM=3.5
     -DCMAKE_POSITION_INDEPENDENT_CODE=ON
     -DENABLE_TESTING=off

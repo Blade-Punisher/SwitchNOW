@@ -1,10 +1,23 @@
+#ifdef __SWITCH__
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE
+#endif
+#endif
+
 #include "http_client.hpp"
+#include "proxy_diagnostics.hpp"
+#include "server_probe_policy.hpp"
+#include "network_probe_budget.hpp"
+#include "http_socket_guard.hpp"
+#include "connection_debug_curl.hpp"
 
 #include "runtime_journal.hpp"
 
 #include <curl/curl.h>
 
 #include <array>
+#include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <memory>
@@ -18,11 +31,35 @@ namespace opennow
 namespace
 {
 
+struct BodySink { std::string* body; size_t maximum; };
 size_t WriteBody(char* ptr, size_t size, size_t nmemb, void* userdata)
 {
-    const size_t bytes = size * nmemb;
-    auto* body         = static_cast<std::string*>(userdata);
-    body->append(ptr, bytes);
+    if(size && nmemb > SIZE_MAX/size)return 0;
+    const size_t bytes=size*nmemb;
+    auto& sink=*static_cast<BodySink*>(userdata);
+    if(sink.maximum && (sink.body->size()>sink.maximum || bytes>sink.maximum-sink.body->size()))return 0;
+    try {sink.body->append(ptr,bytes);}catch(...){return 0;}
+    return bytes;
+}
+size_t ReadArtworkHeaders(char* ptr,size_t size,size_t nmemb,void* userdata)
+{
+    if(size && nmemb>SIZE_MAX/size)return 0;
+    const auto bytes=size*nmemb;
+    auto& response=*static_cast<HttpResponse*>(userdata);
+    try {
+        std::string line(ptr,bytes);
+        if(line.rfind("HTTP/",0)==0){response.etag.clear();response.last_modified.clear();return bytes;}
+        const auto colon=line.find(':');if(colon==std::string::npos)return bytes;
+        std::string name=line.substr(0,colon);
+        std::transform(name.begin(),name.end(),name.begin(),[](unsigned char c){return std::tolower(c);});
+        auto value=line.substr(colon+1);const auto first=value.find_first_not_of(" \t");
+        value=first==std::string::npos ? "" : value.substr(first);
+        while(!value.empty() && (value.back()=='\r'||value.back()=='\n'||value.back()==' '))value.pop_back();
+        if(value.size()<=1024 && value.find_first_of("\r\n")==std::string::npos) {
+            if(name=="etag")response.etag=value;
+            if(name=="last-modified")response.last_modified=value;
+        }
+    }catch(...){return 0;}
     return bytes;
 }
 
@@ -76,8 +113,24 @@ HttpResponse HttpClient::Request(
     const std::vector<std::string>& headers,
     const std::string& body,
     long connect_timeout_seconds,
-    long timeout_seconds) const
+    long timeout_seconds,
+    size_t maximum_response_bytes,
+    const std::string& proxy_url,
+    const std::function<bool()>& is_cancelled) const
 {
+    auto cancellation = is_cancelled;
+    if (auto scoped = HttpCancellationScope::Callback()) {
+        cancellation = [scoped, is_cancelled] {
+            return scoped() || (is_cancelled && is_cancelled());
+        };
+    }
+    if (cancellation && cancellation()) throw std::runtime_error("Request cancelled");
+    std::unique_ptr<network::LaunchPriority> priority;
+    if (url.find("/v2/session") != std::string::npos)
+        priority = std::make_unique<network::LaunchPriority>();
+    if (!network::WaitForResources(cancellation))
+        throw std::runtime_error("Request cancelled or network resources still recovering");
+    DownloadProgressContext progress {nullptr, &cancellation};
     const bool artwork_request = IsArtworkRequest(url);
     const bool session_poll_request = IsSessionPollRequest(method, url);
     const bool journal_request = !artwork_request && !session_poll_request;
@@ -87,6 +140,9 @@ HttpResponse HttpClient::Request(
         ? BeginRuntimeOperation("http", method, "url=" + safe_url)
         : 0;
 
+    proxy_diagnostics::Request proxy_trace(method,url,proxy_url);
+    connection_debug::Request connection_trace(method,url,!proxy_url.empty());
+    network::SocketGuard socket_guard {connection_trace};
     CURL* raw = curl_easy_init();
     if (!raw)
     {
@@ -97,6 +153,8 @@ HttpResponse HttpClient::Request(
 
     std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> curl(raw, &curl_easy_cleanup);
     std::string response_body;
+    BodySink body_sink {&response_body, maximum_response_bytes};
+    HttpResponse response_headers;
     std::array<char, CURL_ERROR_SIZE> error_buffer {};
 
     curl_slist* raw_headers = nullptr;
@@ -112,12 +170,24 @@ HttpResponse HttpClient::Request(
     curl_easy_setopt(curl.get(), CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl.get(), CURLOPT_CONNECTTIMEOUT, connect_timeout_seconds);
     curl_easy_setopt(curl.get(), CURLOPT_TIMEOUT, timeout_seconds);
+    curl_easy_setopt(curl.get(), CURLOPT_NOSIGNAL, 1L);
+    if (cancellation) {
+        curl_easy_setopt(curl.get(), CURLOPT_NOPROGRESS, 0L);
+        curl_easy_setopt(curl.get(), CURLOPT_XFERINFOFUNCTION, DownloadProgress);
+        curl_easy_setopt(curl.get(), CURLOPT_XFERINFODATA, &progress);
+    }
     curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, WriteBody);
-    curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, &response_body);
+    curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, &body_sink);
+    curl_easy_setopt(curl.get(), CURLOPT_HEADERFUNCTION, ReadArtworkHeaders);
+    curl_easy_setopt(curl.get(), CURLOPT_HEADERDATA, &response_headers);
     curl_easy_setopt(curl.get(), CURLOPT_ACCEPT_ENCODING, "");
     curl_easy_setopt(curl.get(), CURLOPT_SSL_VERIFYPEER, 1L);
     curl_easy_setopt(curl.get(), CURLOPT_SSL_VERIFYHOST, 2L);
     curl_easy_setopt(curl.get(), CURLOPT_ERRORBUFFER, error_buffer.data());
+    // Explicitly disable environment proxies on direct routes; do not let
+    // NO_PROXY silently bypass a proxy the user deliberately configured.
+    curl_easy_setopt(curl.get(), CURLOPT_PROXY, proxy_url.c_str());
+    if (!proxy_url.empty()) curl_easy_setopt(curl.get(), CURLOPT_NOPROXY, "");
 
     if (header_list)
         curl_easy_setopt(curl.get(), CURLOPT_HTTPHEADER, header_list.get());
@@ -138,9 +208,33 @@ HttpResponse HttpClient::Request(
         }
     }
 
-    const CURLcode result = curl_easy_perform(curl.get());
+    network::AttachGuard(curl.get(), socket_guard);
+    CURLcode result = CURLE_OK;
+    for (unsigned attempt = 0;; ++attempt) {
+        socket_guard.attempts = socket_guard.opened = 0; socket_guard.error = 0;
+        result = curl_easy_perform(curl.get());
+        if (!network::SafeResourceRetry(result, socket_guard.error, socket_guard.opened, attempt)) break;
+        LogRuntimeEvent("http", "resource_retry", "url=" + safe_url +
+            " attempt=" + std::to_string(attempt + 1) + " socket_errno=" + std::to_string(socket_guard.error) +
+            " sent=0 cooldown_ms=5000");
+        connection_debug::Event(0, "resource_retry", {{"attempt", std::to_string(attempt + 1)},
+            {"socket_errno", std::to_string(socket_guard.error)}, {"sent", "0"}});
+        if (!network::WaitForResources(cancellation)) break;
+        error_buffer.fill(0); response_body.clear();
+    }
+    connection_debug::Finish(curl.get(),connection_trace,result);
     const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - started_at).count();
+    if (proxy_trace.Active()) {
+        long proxy_http_status = 0;
+        curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &proxy_http_status);
+        long proxy_connect_status = 0; double proxy_dns = 0, proxy_connect = 0;
+        curl_easy_getinfo(curl.get(), CURLINFO_HTTP_CONNECTCODE, &proxy_connect_status);
+        curl_easy_getinfo(curl.get(), CURLINFO_NAMELOOKUP_TIME, &proxy_dns);
+        curl_easy_getinfo(curl.get(), CURLINFO_CONNECT_TIME, &proxy_connect);
+        proxy_trace.Finish(static_cast<int>(result), proxy_http_status, elapsed_ms, proxy_connect_status,
+            static_cast<long>(proxy_dns * 1000), static_cast<long>(proxy_connect * 1000));
+    }
     if (result != CURLE_OK)
     {
         long verify_result = 0;
@@ -151,9 +245,11 @@ HttpResponse HttpClient::Request(
         detail << "url=" << safe_url
                << " curl_code=" << static_cast<int>(result)
                << " curl_error=" << curl_easy_strerror(result)
+               << " socket_errno=" << socket_guard.error
+               << " socket_opened=" << socket_guard.opened
                << " ssl_verify=" << verify_result
                << " elapsed_ms=" << elapsed_ms;
-        if (error_buffer[0] != '\0')
+        if (proxy_url.empty() && error_buffer[0] != '\0')
             detail << " backend_error=" << error_buffer.data();
         if (primary_ip && *primary_ip)
             detail << " primary_ip=" << primary_ip;
@@ -184,6 +280,8 @@ HttpResponse HttpClient::Request(
     return HttpResponse{
         .status_code = status_code,
         .body        = std::move(response_body),
+        .etag        = std::move(response_headers.etag),
+        .last_modified = std::move(response_headers.last_modified),
     };
 }
 
@@ -192,11 +290,12 @@ HttpResponse HttpClient::Get(
     const std::string& user_agent,
     const std::vector<std::string>& headers,
     long connect_timeout_seconds,
-    long timeout_seconds) const
+    long timeout_seconds,
+    size_t maximum_response_bytes) const
 {
     return Request(
         "GET", url, user_agent, headers, {},
-        connect_timeout_seconds, timeout_seconds);
+        connect_timeout_seconds, timeout_seconds, maximum_response_bytes);
 }
 
 HttpResponse HttpClient::Post(
@@ -214,13 +313,17 @@ void HttpClient::DownloadToFile(
     const std::string& user_agent,
     const std::vector<std::string>& headers,
     const std::function<void(long long, long long)>& on_progress,
-    const std::function<bool()>& is_cancelled) const
+    const std::function<bool()>& is_cancelled,
+    std::string* effective_url) const
 {
     FILE* output = std::fopen(destination.c_str(), "wb");
     if (!output)
         throw std::runtime_error("Could not create the advertisement media file");
-    std::unique_ptr<FILE, decltype(&std::fclose)> file(output, &std::fclose);
+    const auto close_file = [](FILE* handle) { std::fclose(handle); };
+    std::unique_ptr<FILE, decltype(close_file)> file(output, close_file);
 
+    connection_debug::Request connection_trace("DOWNLOAD",url,false);
+    network::SocketGuard socket_guard {connection_trace};
     CURL* raw = curl_easy_init();
     if (!raw)
         throw std::runtime_error("curl_easy_init failed for media download");
@@ -250,7 +353,14 @@ void HttpClient::DownloadToFile(
     if (header_list)
         curl_easy_setopt(curl.get(), CURLOPT_HTTPHEADER, header_list.get());
 
+    network::AttachGuard(curl.get(), socket_guard);
     const CURLcode result = curl_easy_perform(curl.get());
+    connection_debug::Finish(curl.get(),connection_trace,result);
+    if (effective_url) {
+        char* final_url = nullptr;
+        curl_easy_getinfo(curl.get(), CURLINFO_EFFECTIVE_URL, &final_url);
+        *effective_url = final_url ? final_url : url;
+    }
     long status = 0;
     curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &status);
     file.reset();
@@ -270,15 +380,39 @@ void HttpClient::DownloadToFile(
 
 int HttpClient::MeasureTcpHandshakeLatencyMs(
     const std::string& url,
-    long timeout_ms) const noexcept
-{
+    long timeout_ms, TcpProbeDiagnostics* diagnostics) const noexcept
+try {
+    if (diagnostics) *diagnostics = {};
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(std::max(1L, timeout_ms));
+    static network::ProbeBudget global_budget(1);
+    network::ProbeLease lease(global_budget, deadline);
+    if (!lease) {
+        if (diagnostics) { diagnostics->curl_code = CURLE_OPERATION_TIMEDOUT; diagnostics->detail = "probe_slot_timeout"; }
+        return -1;
+    }
+    timeout_ms = std::max(1L, static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        deadline - std::chrono::steady_clock::now()).count()));
+    if (!network::TakeProbeSlot(deadline)) {
+        if (diagnostics) { diagnostics->detail = "probe_suppressed_priority_rate_or_resource_budget"; diagnostics->suppressed = true; }
+        return -1;
+    }
+    timeout_ms = std::max(1L, static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        deadline - std::chrono::steady_clock::now()).count()));
+    connection_debug::Request connection_trace("PROBE",url,false,true);
+    network::SocketGuard socket_guard {connection_trace, true};
     CURL* raw = curl_easy_init();
     if (!raw)
         return -1;
 
     std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> curl(raw, &curl_easy_cleanup);
-    curl_easy_setopt(curl.get(), CURLOPT_URL, url.c_str());
+    const auto endpoint = server_probe::TcpEndpoint(url);
+    if (endpoint.empty()) return -1;
+    std::array<char, CURL_ERROR_SIZE> error {};
+    curl_easy_setopt(curl.get(), CURLOPT_ERRORBUFFER, error.data());
+    curl_easy_setopt(curl.get(), CURLOPT_URL, endpoint.c_str());
     curl_easy_setopt(curl.get(), CURLOPT_CONNECT_ONLY, 1L);
+    curl_easy_setopt(curl.get(), CURLOPT_PROXY, "");
+    curl_easy_setopt(curl.get(), CURLOPT_FORBID_REUSE, 1L);
     curl_easy_setopt(curl.get(), CURLOPT_CONNECTTIMEOUT_MS, timeout_ms);
     curl_easy_setopt(curl.get(), CURLOPT_TIMEOUT_MS, timeout_ms);
     curl_easy_setopt(curl.get(), CURLOPT_NOSIGNAL, 1L);
@@ -286,8 +420,27 @@ int HttpClient::MeasureTcpHandshakeLatencyMs(
     curl_easy_setopt(curl.get(), CURLOPT_SSL_VERIFYPEER, 1L);
     curl_easy_setopt(curl.get(), CURLOPT_SSL_VERIFYHOST, 2L);
 
-    if (curl_easy_perform(curl.get()) != CURLE_OK)
-        return -1;
+    network::AttachGuard(curl.get(), socket_guard);
+    const auto probe_result = curl_easy_perform(curl.get());
+    connection_debug::Finish(curl.get(),connection_trace,probe_result);
+    if (diagnostics) {
+        diagnostics->curl_code = static_cast<int>(probe_result);
+        curl_easy_getinfo(curl.get(), CURLINFO_OS_ERRNO, &diagnostics->os_error);
+        char* ip = nullptr;
+        if (curl_easy_getinfo(curl.get(), CURLINFO_PRIMARY_IP, &ip) == CURLE_OK && ip)
+            diagnostics->remote_ip = ip;
+        if (socket_guard.error) diagnostics->os_error = socket_guard.error;
+        diagnostics->resource_exhausted = network::ResourceError(socket_guard.error);
+        diagnostics->detail = error.data();
+        double dns = 0, connect = 0, tls = 0;
+        curl_easy_getinfo(curl.get(), CURLINFO_NAMELOOKUP_TIME, &dns);
+        curl_easy_getinfo(curl.get(), CURLINFO_CONNECT_TIME, &connect);
+        curl_easy_getinfo(curl.get(), CURLINFO_APPCONNECT_TIME, &tls);
+        diagnostics->dns_ms = static_cast<int>(std::lround(dns * 1000));
+        diagnostics->connect_ms = connect > 0 ? static_cast<int>(std::lround((connect - dns) * 1000)) : -1;
+        diagnostics->tls_ms = tls > 0 ? static_cast<int>(std::lround((tls - connect) * 1000)) : -1;
+    }
+    if (probe_result != CURLE_OK) return -1;
 
     // A region estimate should reflect the network path, not DNS lookup or
     // variable TLS negotiation. TCP connect is approximately one network RTT.
@@ -302,6 +455,11 @@ int HttpClient::MeasureTcpHandshakeLatencyMs(
         return -1;
 
     return static_cast<int>(std::lround(handshake_seconds * 1000.0));
+} catch (...) {
+    // Optional latency measurement must never terminate the application when
+    // a worker, diagnostics string or wait primitive cannot allocate resources.
+    if (diagnostics) diagnostics->curl_code = CURLE_OUT_OF_MEMORY;
+    return -1;
 }
 
 } // namespace opennow

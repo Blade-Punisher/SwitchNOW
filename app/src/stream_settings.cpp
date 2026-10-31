@@ -1,8 +1,10 @@
 #include "stream_settings.hpp"
+#include "proxy_policy.hpp"
 #include "app_paths.hpp"
 #include "atomic_file_replace.hpp"
 #include "localization.hpp"
 #include "server_location_policy.hpp"
+#include "stream_adaptation_policy.hpp"
 
 #include <jansson.h>
 
@@ -94,7 +96,9 @@ StreamSettings Sanitize(StreamSettings settings)
     if (settings.codec != "H264")
         settings.codec = "H264";
 
-    if (server_location::IsAutomatic(settings.region))
+    if (server_location::IsClosest(settings.region))
+        settings.region = "Closest";
+    else if (server_location::IsAutomatic(settings.region))
         settings.region = "Auto";
     else
     {
@@ -104,7 +108,7 @@ StreamSettings Sanitize(StreamSettings settings)
             settings.region = "Auto";
     }
 
-    settings.audio_volume = std::max(800, std::min(1600, settings.audio_volume));
+    settings.audio_volume = std::max(100, std::min(800, settings.audio_volume));
     settings.audio_buffer_ms = std::max(30, std::min(100, settings.audio_buffer_ms));
     if (settings.video_backend != "Auto" && settings.video_backend != "NVDEC" &&
         settings.video_backend != "Software")
@@ -121,14 +125,28 @@ StreamSettings Sanitize(StreamSettings settings)
     if (settings.controller_layout != "Xbox" && settings.controller_layout != "Switch")
         settings.controller_layout = "Xbox";
 
-    if (settings.image_quality_mode != "Original" &&
-        settings.image_quality_mode != "Adaptive" &&
-        settings.image_quality_mode != "Clarity")
-        settings.image_quality_mode = "Adaptive";
+    settings.image_quality_mode = streaming::NormalizeMode(settings.image_quality_mode);
 
     if (!IsSupportedInterfaceLanguage(settings.interface_language))
         settings.interface_language = "en";
 
+    settings.proxy_url = proxy::NormalizeUrl(settings.proxy_url);
+    if (!proxy::ValidCredential(settings.proxy_username)) settings.proxy_username.clear();
+    if (!proxy::ValidCredential(settings.proxy_password)) settings.proxy_password.clear();
+    if (settings.proxy_url.empty()) settings.proxy_enabled = false;
+    return settings;
+}
+
+StreamSettings MakePreset(
+    const char* id, const char* label, int width, int height, int fps, int bitrate_kbps)
+{
+    StreamSettings settings;
+    settings.preset_id = id;
+    settings.label = label;
+    settings.width = width;
+    settings.height = height;
+    settings.fps = fps;
+    settings.bitrate_kbps = bitrate_kbps;
     return settings;
 }
 
@@ -137,9 +155,9 @@ StreamSettings Sanitize(StreamSettings settings)
 const std::vector<StreamSettings>& StreamPresets()
 {
     static const std::vector<StreamSettings> presets = {
-        {"safe", "Safe", 1280, 720, 30, 8000, "H264", "Auto"},
-        {"balanced", "Balanced", 1280, 720, 60, 12000, "H264", "Auto"},
-        {"quality", "Quality", 1920, 1080, 60, 20000, "H264", "Auto"},
+        MakePreset("safe", "Safe", 1280, 720, 30, 8000),
+        MakePreset("balanced", "Balanced", 1280, 720, 60, 12000),
+        MakePreset("quality", "Quality", 1920, 1080, 60, 20000),
     };
     return presets;
 }
@@ -223,9 +241,14 @@ StreamSettings LoadStreamSettings()
     // unusually quiet. The previous 6x default becomes the new 12x default.
     if (gain_version < 4 && settings.audio_volume <= 800)
         settings.audio_volume = std::max(800, std::min(1600, settings.audio_volume * 2));
+    // R6 restores headroom for the limiter. Preserve the user's relative
+    // setting while moving the previous 8x-16x scale to 4x-8x.
+    if (gain_version < 5)
+        settings.audio_volume = std::max(100, std::min(800, settings.audio_volume / 2));
     settings.audio_buffer_ms = JsonInt(root.get(), "audio_buffer_ms", settings.audio_buffer_ms);
     settings.video_backend = JsonField(root.get(), "video_backend", settings.video_backend);
     settings.debug_diagnostics = JsonBool(root.get(), "debug_diagnostics", false);
+    settings.stats_overlay_enabled = JsonBool(root.get(), "stats_overlay_enabled", false);
     settings.game_language = JsonField(root.get(), "game_language", settings.game_language);
     settings.persist_game_settings = JsonBool(
         root.get(), "persist_game_settings", settings.persist_game_settings);
@@ -235,6 +258,12 @@ StreamSettings LoadStreamSettings()
         root.get(), "image_quality_mode", settings.image_quality_mode);
     settings.interface_language = JsonField(
         root.get(), "interface_language", settings.interface_language);
+    settings.proxy_enabled = JsonBool(
+        root.get(), "proxy_enabled", settings.proxy_enabled);
+    settings.proxy_url = JsonField(
+        root.get(), "proxy_url", settings.proxy_url);
+    settings.proxy_username = JsonField(root.get(), "proxy_username", {});
+    settings.proxy_password = JsonField(root.get(), "proxy_password", {});
     return Sanitize(settings);
 }
 
@@ -254,10 +283,11 @@ bool SaveStreamSettings(const StreamSettings& settings)
     json_object_set_new(root.get(), "region", json_string(clean.region.c_str()));
     json_object_set_new(root.get(), "audio_enabled", json_boolean(clean.audio_enabled));
     json_object_set_new(root.get(), "audio_volume", json_integer(clean.audio_volume));
-    json_object_set_new(root.get(), "audio_gain_version", json_integer(4));
+    json_object_set_new(root.get(), "audio_gain_version", json_integer(5));
     json_object_set_new(root.get(), "audio_buffer_ms", json_integer(clean.audio_buffer_ms));
     json_object_set_new(root.get(), "video_backend", json_string(clean.video_backend.c_str()));
     json_object_set_new(root.get(), "debug_diagnostics", json_boolean(clean.debug_diagnostics));
+    json_object_set_new(root.get(), "stats_overlay_enabled", json_boolean(clean.stats_overlay_enabled));
     json_object_set_new(root.get(), "game_language", json_string(clean.game_language.c_str()));
     json_object_set_new(
         root.get(), "persist_game_settings", json_boolean(clean.persist_game_settings));
@@ -267,6 +297,12 @@ bool SaveStreamSettings(const StreamSettings& settings)
         root.get(), "image_quality_mode", json_string(clean.image_quality_mode.c_str()));
     json_object_set_new(
         root.get(), "interface_language", json_string(clean.interface_language.c_str()));
+    json_object_set_new(
+        root.get(), "proxy_enabled", json_boolean(clean.proxy_enabled));
+    json_object_set_new(
+        root.get(), "proxy_url", json_string(clean.proxy_url.c_str()));
+    json_object_set_new(root.get(), "proxy_username", json_string(clean.proxy_username.c_str()));
+    json_object_set_new(root.get(), "proxy_password", json_string(clean.proxy_password.c_str()));
 
     char* dump = json_dumps(root.get(), JSON_INDENT(2));
     if (!dump)

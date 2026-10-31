@@ -121,6 +121,7 @@ struct RtpDecoder {
   uint32_t nal_units_completed;
   uint32_t access_units_completed;
   uint32_t access_units_dropped;
+  uint32_t last_dropped_timestamp;
   uint32_t single_packets;
   uint32_t stap_packets;
   uint32_t fu_packets;
@@ -175,6 +176,8 @@ void rtp_decoder_set_video_callback(RtpDecoder* rtp_decoder, RtpOnVideoPacket on
 void rtp_decoder_cleanup(RtpDecoder* rtp_decoder);
 
 int rtp_decoder_decode(RtpDecoder* rtp_decoder, const uint8_t* data, size_t size);
+
+void rtp_decoder_poll(RtpDecoder* rtp_decoder);
 
 void rtp_decoder_set_reorder_grace_ms(RtpDecoder* rtp_decoder, uint32_t hold_ms);
 void rtp_decoder_set_reorder_burst_grace_ms(RtpDecoder* rtp_decoder,

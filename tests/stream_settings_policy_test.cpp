@@ -34,12 +34,14 @@ int main()
     value.bitrate_kbps = 25000;
     opennow::settings::CycleBitrate(value);
     assert(value.bitrate_kbps == 8000);
+    opennow::settings::CycleBitrate(value);
+    assert(value.bitrate_kbps == 10000);
 
     opennow::settings::CycleImageQuality(value);
-    assert(value.image_quality_mode == "Clarity");
+    assert(value.image_quality_mode == "Quality");
     opennow::settings::CycleImageQuality(value);
-    assert(value.image_quality_mode == "Original");
+    assert(value.image_quality_mode == "Performance");
     opennow::settings::CycleImageQuality(value);
-    assert(value.image_quality_mode == "Adaptive");
+    assert(value.image_quality_mode == "Balanced");
     return 0;
 }

@@ -8,6 +8,9 @@
 #include <cstdio>
 #include <ctime>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <direct.h>
+#endif
 
 namespace opennow
 {
@@ -18,8 +21,13 @@ constexpr const char* kHistoryPath = "sdmc:/switch/SwitchNOW/play_history.json";
 
 void EnsureAppDirectory()
 {
+#ifdef _WIN32
+    _mkdir("sdmc:/switch");
+    _mkdir("sdmc:/switch/SwitchNOW");
+#else
     mkdir("sdmc:/switch", 0777);
     mkdir("sdmc:/switch/SwitchNOW", 0777);
+#endif
 }
 
 std::string JsonString(json_t* object, const char* key)

@@ -97,11 +97,18 @@ class SettingsTab : public brls::Box
     bool CycleAudioVolume(brls::View* view);
     bool CycleAudioBuffer(brls::View* view);
     bool ToggleDebugDiagnostics(brls::View* view);
+    bool ToggleStatsOverlay(brls::View* view);
+    bool ToggleProxy(brls::View* view);
+    bool EditProxy(brls::View* view, int field);
     bool ShowDiagnostics(brls::View* view);
     bool ChooseInterfaceLanguage(brls::View* view);
     bool CheckForUpdates(brls::View* view);
 
     GfnClient client_;
+    brls::Label* title_label_ = nullptr;
+    brls::Label* hint_label_ = nullptr;
+    brls::Label* nav_label_ = nullptr;
+    brls::Label* nav_hint_ = nullptr;
     brls::Label* page_title_ = nullptr;
     brls::Label* page_subtitle_ = nullptr;
     brls::Label* save_status_ = nullptr;

@@ -1,0 +1,95 @@
+#include "stream_adaptation_policy.hpp"
+#include <cassert>
+int main() {
+    using namespace opennow::streaming;
+    assert(NormalizeMode("Motion") == "Balanced");
+    assert(NormalizeMode("Adaptive") == "Balanced");
+    assert(NormalizeMode("Clarity") == "Quality");
+    assert(NormalizeMode("Original") == "Performance");
+    Adaptation a;
+    a.Update({60,60,60,1,0,0,0,500});
+    assert(a.protection == 0);
+    a.Update({60,60,60,1,0,0,0,500});
+    assert(a.protection == 1);
+    const int protected_budget = a.WaitBudgetUs("Balanced");
+    for (int i=0;i<19;++i) a.Update({60,60,60,0,0});
+    assert(a.protection == 1);
+    a.Update({60,60,60,0,0});
+    assert(a.protection == 0 && a.WaitBudgetUs("Balanced") < protected_budget);
+    for (int i=0;i<60;++i) a.Update({30,30,60,0,0});
+    assert(a.pressure == Pressure::SourceSlow && a.protection == 0);
+    assert(a.WaitBudgetUs("Quality") == 1000);
+    a.Update({60,30,60,0,4});
+    assert(a.pressure == Pressure::DecoderBusy);
+    assert(RecoveryRetryMs(50) == 200 && RecoveryRetryMs(300) == 600);
+    assert(RecoveryRetryMs(50, 0, 1000) == 200);
+    assert(RecoveryRetryMs(50, 4, 1000) > RecoveryRetryMs(50, 1, 0));
+    assert(RecoveryRetryMs(50, 0, 1000, false) == 200);
+    assert(RecoveryRetryMs(50, 1, 1000, false) >= 500);
+    assert(RecoveryRetryMs(50, 2, 1000, false) >= 1000);
+    assert(RecoveryRetryMs(50, 1, 0, true) == 200);
+    LivePauseTracker tracker;
+    assert(!tracker.Observe(1000000, 1000000, 1000000, 100));
+    assert(!tracker.Observe(1080000, 1000000, 1000000, 100));
+    const auto transport = tracker.Observe(1200000, 1200000, 1000000, 101);
+    assert(transport && transport.cause == PauseCause::Transport);
+    assert(transport.duration_us >= 100000);
+    assert(!tracker.Observe(1280000, 1200000, 1270000, 101));
+    const auto source = tracker.Observe(1340000, 1340000, 1300000, 102);
+    assert(source && source.cause == PauseCause::Uncertain);
+    assert(!tracker.Observe(1420000, 1340000, 1340000, 102));
+    assert(!tracker.Observe(1430000, 1340000, 1340000, 110));
+    const auto assembly = tracker.Observe(1500000, 1500000, 1340000, 111);
+    assert(assembly && assembly.cause == PauseCause::Uncertain);
+    assert(!tracker.Observe(1580000, 1500000, 1500000, 111, 0));
+    assert(!tracker.Observe(1600000, 1500000, 1500000, 120, 1));
+    const auto damaged = tracker.Observe(1670000, 1670000, 1500000, 121, 1);
+    assert(damaged.cause == PauseCause::VideoAssembly);
+    // Old audio received only at the start cannot certify source starvation.
+    LivePauseTracker stale_audio;
+    stale_audio.Observe(2000000, 2000000, 2000000, 1);
+    stale_audio.Observe(2200000, 2000000, 2020000, 1);
+    assert(stale_audio.Observe(2250000, 2250000, 2020000, 2).cause == PauseCause::Transport);
+    Adaptation short_pause;
+    short_pause.Update({60, 60, 60, 0, 0, 1});
+    assert(short_pause.pressure == Pressure::DeliveryStall);
+    assert(short_pause.protection == 0 && short_pause.WaitBudgetUs("Balanced") == 1000);
+    short_pause.Update({60,60,60,0,0,0,0,500});
+    assert(short_pause.pressure == Pressure::Recovering);
+    for (int i=0;i<8;++i) short_pause.Update({60,60,60,0,0,0,0,500});
+    assert(short_pause.pressure == Pressure::Stable && short_pause.WaitBudgetUs("Balanced") == 3000);
+    Adaptation uncertain;
+    for (int i=0;i<20;++i) uncertain.Update({60,60,60,0,0,0,1,500});
+    assert(uncertain.protection == 0);
+    Adaptation decoder;
+    decoder.Update({60,30,60,2,4,0,1,500});
+    assert(decoder.pressure == Pressure::DecoderBusy && decoder.WaitBudgetUs("Quality") == 1000);
+    Adaptation hysteresis;
+    for (int i=0;i<40;++i) {
+        hysteresis.Update({50,50,60,0,0,0,0,500});
+        assert(hysteresis.pressure == Pressure::Stable);
+        hysteresis.Update({60,60,60,0,0,0,0,500});
+        assert(hysteresis.pressure == Pressure::Stable);
+    }
+    hysteresis.Update({50,50,60,0,0,0,0,500});
+    hysteresis.Update({50,50,60,0,0,0,0,500});
+    assert(hysteresis.pressure == Pressure::SourceSlow);
+    for (int i=0;i<2;++i) hysteresis.Update({60,60,60,0,0,0,0,500});
+    assert(hysteresis.pressure == Pressure::SourceSlow);
+    hysteresis.Update({60,60,60,0,0,0,0,500});
+    assert(hysteresis.pressure == Pressure::Stable);
+    assert(hysteresis.WaitBudgetUs("Balanced") < 3000);
+    for (int i=0;i<4;++i) hysteresis.Update({60,60,60,0,0,0,0,500});
+    assert(hysteresis.WaitBudgetUs("Balanced") == 3000);
+    hysteresis.Update({20,20,60,0,0,0,0,500});
+    assert(hysteresis.pressure == Pressure::SourceSlow); // Severe gaps react immediately.
+    Adaptation bursty;
+    for (int i=0;i<8;++i) bursty.Update({60,60,60,0,0,0,0,500,8000});
+    assert(bursty.delivery_guard_us == 1500 && bursty.WaitBudgetUs("Balanced") == 4500);
+    bursty.Update({20,20,60,0,0,0,0,500,20000});
+    assert(bursty.delivery_guard_us == 0 && bursty.WaitBudgetUs("Balanced") == 1000);
+    for (int i=0;i<16;++i) bursty.Update({60,60,60,0,0,0,0,500,0});
+    assert(bursty.WaitBudgetUs("Balanced") == 3000);
+    assert(AudioTargetMs("Quality",40) == 50);
+    assert(AudioTargetMs("Performance",80) == 80);
+}

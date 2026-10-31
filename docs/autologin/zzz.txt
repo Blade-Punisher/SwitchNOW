@@ -1,0 +1,7 @@
+Zenless Zone Zero - R70 auto-login
+Configure credentials on the game's detail page in SwitchNOW.
+Saved file: sdmc:/switch/SwitchNOW/zzz/zzz.txt
+Format: email=YOUR_EMAIL_OR_USERNAME on line 1, password=YOUR_PASSWORD on line 2.
+Credentials are stored in plain text. Never send this file with a bug report.
+Open the HoYoverse email/password form, then hold Minus + R3 for 0.3s and press X. B cancels.
+Use a 16:9 stream. Captcha/verification remain manual.

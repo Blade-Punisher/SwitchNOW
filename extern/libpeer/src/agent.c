@@ -10,6 +10,7 @@
 #include "ice_candidate_pair_policy.h"
 #include "ports.h"
 #include "socket.h"
+#include "udp_receive_batch.h"
 #include "stun.h"
 #include "utils.h"
 
@@ -40,6 +41,7 @@ void agent_clear_candidates(Agent* agent) {
   agent->rtt_probe_sequence = 0;
   agent->rtt_current_ms = 0;
   agent->rtt_min_ms = 0;
+  agent->rtt_median_ms = 0;
   agent->rtt_p95_ms = 0;
   agent->rtt_jitter_q4 = 0;
   memset(agent->rtt_samples, 0, sizeof(agent->rtt_samples));
@@ -100,6 +102,32 @@ static int agent_socket_recv_timeout(Agent* agent, Address* addr, uint8_t* buf,
 #endif
   };
 
+  // Switch's select(0) still performs a socket-service IPC round trip and can
+  // stall for tens of milliseconds. These UDP sockets are O_NONBLOCK and the
+  // receive wrapper uses MSG_DONTWAIT, so the live worker can read directly.
+  int cached = 0;
+  for (i = 0; i < (int)(sizeof(addr_type) / sizeof(addr_type[0])); ++i) {
+    const UdpReceiveBatch* batch = agent->udp_sockets[i].receive_batch;
+    if (batch && batch->next < batch->count) cached = 1;
+  }
+  // A timed compatibility poll must not wait on the kernel when read-ahead
+  // already owns the next datagram, even if the OS socket is now empty.
+  if (timeout_ms == 0 || cached) {
+    const uint32_t read_started = ports_get_epoch_time();
+    int error = 0;
+    for (i = 0; i < (int)(sizeof(addr_type) / sizeof(addr_type[0])); ++i) {
+      if (agent->udp_sockets[i].fd < 0) continue;
+      ret = udp_socket_recvfrom(&agent->udp_sockets[i], addr, buf, len);
+      if (ret > 0) {
+        agent->recv_read_ms = ports_get_epoch_time() - read_started;
+        return ret;
+      }
+      if (ret < 0) error = ret;
+    }
+    agent->recv_read_ms = ports_get_epoch_time() - read_started;
+    return error;
+  }
+
   tv.tv_sec = 0;
   tv.tv_usec = timeout_ms * 1000;
   FD_ZERO(&rfds);
@@ -113,16 +141,20 @@ static int agent_socket_recv_timeout(Agent* agent, Address* addr, uint8_t* buf,
     }
   }
 
+  const uint32_t select_started = ports_get_epoch_time();
   ret = select(maxfd + 1, &rfds, NULL, NULL, &tv);
+  agent->recv_select_ms = ports_get_epoch_time() - select_started;
   if (ret < 0) {
     LOGE("select error");
   } else if (ret == 0) {
     // timeout
   } else {
-    for (i = 0; i < 2; i++) {
-      if (FD_ISSET(agent->udp_sockets[i].fd, &rfds)) {
+    for (i = 0; i < sizeof(addr_type) / sizeof(addr_type[0]); i++) {
+      if (agent->udp_sockets[i].fd >= 0 && FD_ISSET(agent->udp_sockets[i].fd, &rfds)) {
         memset(buf, 0, len);
+        const uint32_t read_started = ports_get_epoch_time();
         ret = udp_socket_recvfrom(&agent->udp_sockets[i], addr, buf, len);
+        agent->recv_read_ms = ports_get_epoch_time() - read_started;
         break;
       }
     }
@@ -428,6 +460,9 @@ static void agent_refresh_rtt_percentile(Agent* agent) {
     sorted[j] = value;
   }
   if (count > 0) {
+    agent->rtt_median_ms = count % 2 == 0
+        ? (sorted[count / 2 - 1] + sorted[count / 2] + 1) / 2
+        : sorted[count / 2];
     const uint16_t percentile_index =
         (uint16_t)(((uint32_t)count * 95 + 99) / 100 - 1);
     agent->rtt_p95_ms = sorted[percentile_index];
@@ -539,6 +574,7 @@ void agent_process_stun_response(Agent* agent, StunMessage* stun_msg,
 }
 
 int agent_recv_timeout(Agent* agent, uint8_t* buf, int len, int timeout_ms) {
+  agent->recv_select_ms = agent->recv_read_ms = agent->recv_stun_ms = 0;
   int ret = -1;
   StunMessage stun_msg;
   Address addr;
@@ -546,6 +582,7 @@ int agent_recv_timeout(Agent* agent, uint8_t* buf, int len, int timeout_ms) {
     agent->binding_request_time = ports_get_epoch_time();
   }
   if (ret > 0 && stun_probe(buf, len) == 0) {
+    const uint32_t stun_started = ports_get_epoch_time();
     memcpy(stun_msg.buf, buf, ret);
     stun_msg.size = ret;
     stun_parse_msg_buf(&stun_msg);
@@ -562,6 +599,7 @@ int agent_recv_timeout(Agent* agent, uint8_t* buf, int len, int timeout_ms) {
         break;
     }
     ret = 0;
+    agent->recv_stun_ms = ports_get_epoch_time() - stun_started;
   }
   return ret;
 }
@@ -784,6 +822,7 @@ void agent_get_rtt_stats(Agent* agent, AgentRttStats* stats) {
   stats->current_ms = -1;
   stats->smoothed_ms = -1;
   stats->min_ms = -1;
+  stats->median_ms = -1;
   stats->p95_ms = -1;
   stats->jitter_ms = -1;
   if (!agent) {
@@ -796,6 +835,7 @@ void agent_get_rtt_stats(Agent* agent, AgentRttStats* stats) {
                            ? (int)agent->smoothed_binding_rtt_ms
                            : -1;
   stats->min_ms = agent->rtt_min_ms > 0 ? (int)agent->rtt_min_ms : -1;
+  stats->median_ms = agent->rtt_median_ms > 0 ? (int)agent->rtt_median_ms : -1;
   stats->p95_ms = agent->rtt_p95_ms > 0 ? (int)agent->rtt_p95_ms : -1;
   stats->jitter_ms = agent->rtt_sample_count > 1
                          ? (int)((agent->rtt_jitter_q4 + 8) >> 4)
@@ -829,6 +869,7 @@ void agent_rtt_probe_tick(Agent* agent) {
     agent->smoothed_binding_rtt_ms = 0;
     agent->rtt_current_ms = 0;
     agent->rtt_min_ms = 0;
+    agent->rtt_median_ms = 0;
     agent->rtt_p95_ms = 0;
     agent->rtt_jitter_q4 = 0;
     memset(agent->rtt_samples, 0, sizeof(agent->rtt_samples));

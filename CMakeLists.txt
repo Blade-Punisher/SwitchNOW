@@ -26,6 +26,10 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Keep developer workstation paths out of assertion strings/debug metadata.
+# Apply to dependencies as well as the application, without changing runtime policies.
+add_compile_options("-ffile-prefix-map=${CMAKE_CURRENT_SOURCE_DIR}=.")
+
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
 pkg_check_modules(JANSSON REQUIRED IMPORTED_TARGET jansson)
@@ -33,6 +37,8 @@ pkg_check_modules(JANSSON REQUIRED IMPORTED_TARGET jansson)
 add_subdirectory(extern/borealis/library)
 add_subdirectory(extern/libpeer)
 
+target_include_directories(borealis BEFORE PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/extern/borealis/library/include/borealis/extern/tinyxml2)
 target_include_directories(borealis PUBLIC ${DEVKITPRO}/portlibs/switch/include)
 
 file(GLOB_RECURSE APP_SOURCES CONFIGURE_DEPENDS
@@ -67,7 +73,15 @@ target_link_directories(${PROJECT_NAME}
         ${CMAKE_CURRENT_SOURCE_DIR}/extern/ffmpeg/lib
 )
 
-target_compile_definitions(${PROJECT_NAME} PRIVATE PLATFORM_SWITCH __SWITCH__ HAS_SOCKLEN_T=1)
+option(SWITCHNOW_NETWORK_DEBUG "Always-on credential-free connection diagnostics" OFF)
+if (SWITCHNOW_NETWORK_DEBUG)
+    # Observe the original SDK initialization result before main without editing
+    # vendored Borealis or changing the supplied socket configuration.
+    target_link_options(${PROJECT_NAME} PRIVATE -Wl,--wrap=socketInitialize)
+endif ()
+target_compile_definitions(${PROJECT_NAME} PRIVATE
+    SWITCHNOW_NETWORK_DEBUG=$<BOOL:${SWITCHNOW_NETWORK_DEBUG}>
+    PLATFORM_SWITCH __SWITCH__ HAS_SOCKLEN_T=1)
 if (PLATFORM_SWITCH)
     target_compile_definitions(${PROJECT_NAME} PRIVATE USE_DK_RENDERER BOREALIS_USE_DEKO3D OPENNOW_ENABLE_NVDEC)
     find_program(NX_UAM_EXE NAMES uam HINTS "${DEVKITPRO}/tools/bin")
@@ -122,11 +136,14 @@ target_link_libraries(${PROJECT_NAME}
         bz2
 )
 
-set(PROJECT_AUTHOR "OpenCloudGaming")
-set(PROJECT_VERSION_STRING "1.2.0")
+set(PROJECT_AUTHOR "Blade-Punisher")
+set(PROJECT_VERSION_STRING "1.3.0" CACHE STRING "Display version embedded in SwitchNOW")
 set(PROJECT_TITLEID "05004F4E4F575358")
 set(PROJECT_ICON ${CMAKE_CURRENT_SOURCE_DIR}/resources/icon/icon.jpg)
 set(PROJECT_ROMFS_DIR ${CMAKE_BINARY_DIR}/romfs)
+
+target_compile_definitions(SwitchNOW PRIVATE
+    SWITCHNOW_VERSION_STRING="${PROJECT_VERSION_STRING}")
 
 add_executable(SwitchNOWShortcut app/shortcut/main.c)
 target_compile_options(SwitchNOWShortcut PRIVATE -Wall -Wextra -Werror)
@@ -136,8 +153,8 @@ add_custom_target(SwitchNOWShortcut.nro
     COMMAND ${NX_NACPTOOL_EXE}
         --create
         "SwitchNOW Game Shortcut"
-        "SwitchNOW"
-        "SwitchNOW"
+        "${PROJECT_AUTHOR}"
+        "${PROJECT_VERSION_STRING}"
         SwitchNOWShortcut.nacp
         --titleid=05004F4E53484F52
     COMMAND ${NX_ELF2NRO_EXE}
@@ -162,7 +179,7 @@ add_custom_target(SwitchNOWUpdater.nro
     COMMAND ${NX_NACPTOOL_EXE}
         --create
         "SwitchNOW Update Helper"
-        "SwitchNOW"
+        "${PROJECT_AUTHOR}"
         "${PROJECT_VERSION_STRING}"
         SwitchNOWUpdater.nacp
         --titleid=05004F4E55504454

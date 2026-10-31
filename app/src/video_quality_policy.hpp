@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include "stream_adaptation_policy.hpp"
 
 namespace opennow::video
 {
@@ -22,24 +23,20 @@ struct QualityTuning
 
 inline QualityTuning ResolveQualityTuning(const std::string& mode)
 {
-    if (mode == "Original")
-        return {35, 70, 5, 5, 35, 5, 15, 1000, 0.0f, 0.0f, false};
-
-    if (mode == "Clarity")
-        return {50, 88, 8, 10, 30, 8, 8, 1500, 0.13f, 0.20f, true};
-
-    // A small resilience budget and a single spatial shader pass improve
-    // dynamic scenes without adding a queued frame or raising max bitrate.
-    return {45, 82, 6, 8, 30, 6, 10, 1250, 0.10f, 0.14f, true};
+    const auto normalized = streaming::NormalizeMode(mode);
+    if (normalized == "Performance")
+        return {35, 75, 6, 8, 30, 6, 10, 1250, 0.0f, 0.0f, true};
+    if (normalized == "Quality")
+        return {55, 92, 7, 8, 30, 6, 10, 1250, 0.12f, 0.03f, true};
+    return {55, 92, 7, 8, 30, 6, 10, 1250, 0.10f, 0.0f, true};
 }
 
 inline std::string NextQualityMode(const std::string& mode)
 {
-    if (mode == "Adaptive")
-        return "Clarity";
-    if (mode == "Clarity")
-        return "Original";
-    return "Adaptive";
+    const auto normalized = streaming::NormalizeMode(mode);
+    if (normalized == "Performance") return "Balanced";
+    if (normalized == "Balanced") return "Quality";
+    return "Performance";
 }
 
 } // namespace opennow::video

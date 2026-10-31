@@ -10,7 +10,7 @@ public:
     ~SignalingClient();
 
     bool connect();
-    void send_message(const std::string& msg);
+    bool send_message(const std::string& msg);
     void set_on_message(std::function<void(const std::string&)> cb) { on_message_ = cb; }
     void poll();
     bool is_connected() const { return ws_ && ws_->is_connected(); }
@@ -20,6 +20,7 @@ public:
     }
     
     std::string get_last_error() const { return ws_ ? ws_->get_last_error() : "No WS object"; }
+    std::string get_receive_diagnostics() const { return ws_ ? ws_->get_receive_diagnostics() : "unavailable=1"; }
 
 private:
     std::string url_;

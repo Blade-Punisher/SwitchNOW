@@ -21,6 +21,27 @@ inline bool CopyYuv420ToNv12(
         return false;
     }
 
+    // Validate before writing either destination. A smaller source frame must
+    // never be read with copy extents from an older, larger stream resolution.
+    const auto fits = [](ptrdiff_t stride, int row_bytes) {
+        return stride >= row_bytes || stride <= -static_cast<ptrdiff_t>(row_bytes);
+    };
+    if (!fits(y_stride, width) ||
+        !fits(u_or_uv_stride, source_is_nv12 ? width : width / 2) ||
+        (!source_is_nv12 && !fits(v_stride, width / 2)))
+        return false;
+
+    // NVDEC's software transfer normally returns tightly packed NV12. Copy
+    // each complete plane in one operation instead of issuing 1080 small
+    // memcpy calls for every 720p frame.
+    if (source_is_nv12 && y_stride == width && u_or_uv_stride == width) {
+        std::memcpy(output_y, y_plane,
+                    static_cast<size_t>(width) * static_cast<size_t>(height));
+        std::memcpy(output_uv, u_or_uv_plane,
+                    static_cast<size_t>(width) * static_cast<size_t>(height / 2));
+        return true;
+    }
+
     for (int row = 0; row < height; ++row) {
         std::memcpy(output_y + static_cast<size_t>(row) * width,
                     y_plane + static_cast<ptrdiff_t>(row) * y_stride,

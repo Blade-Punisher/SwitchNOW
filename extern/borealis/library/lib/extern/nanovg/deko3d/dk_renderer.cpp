@@ -111,7 +111,7 @@ namespace nvg {
     {
         printf("DkRenderer create\n");
         /* Create a dynamic command buffer and allocate memory for it. */
-        m_dyn_cmd_buf = dk::CmdBufMaker{m_device}.create();
+        m_dyn_cmd_buf = dk::CmdBufMaker{m_device}.setUserData(this).setCbAddMem(AddCommandMemory).create();
         m_dyn_cmd_mem.allocate(m_data_mem_pool, DynamicCmdSize);
 
         m_image_descriptor_set.allocate(m_data_mem_pool);
@@ -153,6 +153,9 @@ namespace nvg {
     }
 
     DkRenderer::~DkRenderer() {
+        m_queue.waitIdle();
+        m_command_spill.Destroy();
+        m_retired_textures.ReleaseAfterFence();
         if (m_vertex_buffer) {
             m_vertex_buffer->destroy();
         }
@@ -495,6 +498,9 @@ namespace nvg {
         for (auto it = m_textures.begin(); it != m_textures.end();) {
             /* Remove textures with the given id. */
             if ((*it)->GetId() == image) {
+                // Deletion can happen during widget traversal while the GPU
+                // is still using the previous frame's immutable image memory.
+                m_retired_textures.Retire(*it);
                 it = m_textures.erase(it);
                 found = true;
             } else {
@@ -561,6 +567,10 @@ namespace nvg {
         if (ctx.ncalls > 0) {
             /* Prepare dynamic command buffer. */
             m_dyn_cmd_mem.begin(m_dyn_cmd_buf);
+            // begin() has waited for the prior frame's fence. Overflow blocks
+            // are now safe to reuse, including uniforms embedded in commands.
+            m_command_spill.BeginFrame();
+            m_retired_textures.ReleaseAfterFence();
 
             /* Update buffers with data. */
             this->UpdateVertexBuffer(ctx.verts, ctx.nverts * sizeof(NVGvertex));
@@ -606,6 +616,13 @@ namespace nvg {
         ctx.npaths = 0;
         ctx.ncalls = 0;
         ctx.nuniforms = 0;
+    }
+
+    void DkRenderer::AddCommandMemory(void* user, DkCmdBuf cmdbuf, size_t minimum) {
+        auto& renderer = *static_cast<DkRenderer*>(user);
+        auto block = renderer.m_command_spill.Acquire(minimum,
+            [&](uint32_t size) { return renderer.m_data_mem_pool.allocate(size); });
+        if (block) dk::CmdBuf{cmdbuf}.addMemory(block.getMemBlock(), block.getOffset(), block.getSize());
     }
 
 }

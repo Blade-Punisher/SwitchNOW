@@ -32,4 +32,9 @@ bool SensitiveInputLoggingSuppressed()
     return g_sensitive_input_logging_suppressed.load(std::memory_order_acquire);
 }
 
+bool CanLogInputPayload(std::string_view label)
+{
+    return !SensitiveInputLoggingSuppressed() || (label != "key_down" && label != "key_up");
+}
+
 } // namespace opennow

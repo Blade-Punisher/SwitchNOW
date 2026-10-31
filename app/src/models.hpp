@@ -1,4 +1,5 @@
 #pragma once
+#include "gfn/cloud_client_profile.hpp"
 
 #include <cstdint>
 #include <string>
@@ -74,6 +75,17 @@ struct NativeCredentials
     std::string provider_id;
     std::string email;
     std::string password;
+};
+
+struct ResumableCloudSession {
+    std::string server;
+    std::string session_id;
+    std::string launch_app_id;
+    std::string title;
+    std::int64_t started_at_ms = 0;
+    int width = 0, height = 0, fps = 0;
+    std::string codec;
+    std::string store;
 };
 
 struct GameVariant
@@ -189,22 +201,52 @@ struct StreamRegion
     int selection_score_ms = -1;
     int successful_probes = 0;
     int attempted_probes = 0;
+    bool probe_degraded = false;
+    int observed_stream_rtt_ms = -1;
+    int observed_stream_p95_ms = -1;
+    int observed_transport_pause_count = 0;
+    int observed_transport_pause_ms = 0;
+    int observed_playback_pause_count = 0;
+    int observed_playback_pause_ms = 0;
+    int observed_session_seconds = 0;
+    std::int64_t observed_at_ms = 0;
+    std::string observed_server_host;
+    std::string observed_media_endpoint;
+    // Derived from recent, individual requested-region -> actual-node sessions.
+    int route_history_penalty_ms = 0;
+    int route_history_samples = 0;
+    int route_history_redirects = 0;
+    int route_history_expected_rtt_ms = -1;
+    std::int64_t route_history_at_ms = 0;
+    std::string zone_id;
+    int zone_queue_estimate = -1;
+    std::int64_t zone_queue_at_ms = 0;
+    std::int64_t zone_catalog_at_ms = 0;
 };
 
 struct SessionInfo
 {
     std::string session_id;
-    int status = 0;
-    int queue_position = 0;
+    int status = -1;
+    int queue_position = -1; // -1: unknown/missing; 0: explicitly no position
+    std::string queue_source = "missing";
+    bool queue_conflict = false;
+    int seat_setup_step = -1;
     bool app_patching = false;
     
     // WebRTC / GFN Streaming details
     std::string session_token;
     std::string server_ip;
+    // Control routing is distinct from the regional node and media endpoint.
+    std::string control_ip;
     std::string signaling_url;
+    gfn::cloud_session::ClientProfile cloud_client_profile = gfn::cloud_session::ClientProfile::NativeWebRtc;
+    std::vector<std::string> signaling_candidates;
     std::string media_ip;
     std::string requested_region_url;
     std::string assigned_server_id;
+    std::string initial_server_ip;
+    unsigned server_redirects = 0;
     int media_port = 0;
     std::vector<IceServerInfo> ice_servers;
     AdBreakInfo ad_break;

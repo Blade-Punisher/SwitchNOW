@@ -4,6 +4,13 @@
 #include "config.h"
 #include "dtls_srtp.h"
 #include "utils.h"
+#include "sctp_reliable_queue.h"
+#include "sctp_handshake_retry.h"
+
+// Retryable backpressure; the association remains connected.
+#ifndef SCTP_SEND_WINDOW_FULL
+#define SCTP_SEND_WINDOW_FULL (-2)
+#endif
 
 typedef enum DecpMsgType {
 
@@ -112,6 +119,10 @@ typedef struct SctpDataChunk {
 
 } SctpDataChunk;
 
+#ifndef __cplusplus
+_Static_assert(sizeof(SctpDataChunk) == 16, "SCTP DATA wire header must remain 16 bytes");
+#endif
+
 typedef struct SctpInitChunk {
   SctpChunkCommon common;
   uint32_t initiate_tag;
@@ -154,7 +165,15 @@ typedef struct Sctp {
   int remote_port;
   int connected;
   uint32_t verification_tag;
+  uint32_t local_verification_tag;
+  uint32_t initial_tsn;
+  uint16_t outbound_streams, inbound_streams;
+  uint8_t local_cookie[16];
+  int cookie_issued, cookie_echo_pending;
   uint32_t tsn;
+  uint16_t outbound_sequence[SCTP_MAX_STREAMS];
+  SctpReliableQueue reliable_outbound;
+  SctpHandshakeRetry handshake_retry;
   uint32_t last_outbound_tsn;
   uint32_t last_outbound_sent_ms;
   uint32_t smoothed_rtt_ms;
@@ -183,7 +202,13 @@ int sctp_is_connected(Sctp* sctp);
 
 int sctp_get_rtt_ms(Sctp* sctp);
 
+void sctp_set_diagnostics_enabled(int enabled);
+void sctp_set_diagnostics_sink(void (*sink)(const char*, int));
+void sctp_flush_diagnostics(void);
+
 void sctp_incoming_data(Sctp* sctp, char* buf, size_t len);
+
+void sctp_retransmit_pending(Sctp* sctp);
 
 int sctp_outgoing_data(Sctp* sctp, char* buf, size_t len, SctpDataPpid ppid, uint16_t sid);
 

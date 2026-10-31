@@ -57,7 +57,7 @@ TopBarFrame::TopBarFrame()
     account_container_->addView(avatar_image_);
 
     status_label_ = new brls::Label();
-    status_label_->setText("Offline");
+    status_label_->setText(opennow::Tr("Offline"));
     status_label_->setFontSize(16);
     status_label_->setHorizontalAlign(brls::HorizontalAlign::RIGHT);
     status_label_->setTextColor(nvgRGB(170, 178, 190));
@@ -75,7 +75,7 @@ TopBarFrame::TopBarFrame()
     content_container_->setGrow(1.0f);
     addView(content_container_);
 
-    registerAction("Previous Tab", brls::BUTTON_LB, [this](brls::View* view) {
+    registerAction(opennow::Tr("Previous Tab"), brls::BUTTON_LB, [this](brls::View* view) {
         if (tabs_.empty()) return false;
         int prev = active_tab_index_ - 1;
         if (prev < 0) prev = tabs_.size() - 1;
@@ -83,7 +83,7 @@ TopBarFrame::TopBarFrame()
         return true;
     }, true, false);
 
-    registerAction("Next Tab", brls::BUTTON_RB, [this](brls::View* view) {
+    registerAction(opennow::Tr("Next Tab"), brls::BUTTON_RB, [this](brls::View* view) {
         if (tabs_.empty()) return false;
         int next = active_tab_index_ + 1;
         if (next >= (int)tabs_.size()) next = 0;
@@ -95,6 +95,10 @@ TopBarFrame::TopBarFrame()
 void TopBarFrame::draw(NVGcontext* vg, float x, float y, float width, float height,
                        brls::Style style, brls::FrameContext* ctx)
 {
+    if(displayed_language_!=GetInterfaceLanguage()) {
+        displayed_language_=GetInterfaceLanguage();
+        for(auto& tab:tabs_)tab.header_label->setText(Tr(tab.label));
+    }
     UpdateStatusBar();
     brls::Box::draw(vg, x, y, width, height, style, ctx);
 }
@@ -161,7 +165,7 @@ void TopBarFrame::addTab(const std::string& label, TabViewCreator creator)
 
     // Provide visual feedback for focus
     tab_box->setFocusSound(brls::SOUND_FOCUS_CHANGE);
-    tab_box->registerAction("Select", brls::BUTTON_A, [this, index](brls::View* view) {
+    tab_box->registerAction(opennow::Tr("Select"), brls::BUTTON_A, [this, index](brls::View* view) {
         SelectTab(index);
         return true;
     });
@@ -214,11 +218,17 @@ void TopBarFrame::SelectTab(int index)
         active_content_ = nullptr;
     }
 
+    // Recreate only a detached tab after a locale change. Its callbacks are
+    // guarded by its lifetime token; shared account/game cache remains intact.
+    if(tabs_[index].content&&tabs_[index].language!=GetInterfaceLanguage()) {
+        delete tabs_[index].content;tabs_[index].content=nullptr;
+    }
     brls::View* new_content = tabs_[index].content;
     if (!new_content)
     {
         new_content = tabs_[index].creator();
         tabs_[index].content = new_content;
+        tabs_[index].language=GetInterfaceLanguage();
     }
     if (new_content) {
         new_content->setGrow(1.0f);
@@ -250,9 +260,9 @@ void TopBarFrame::UpdateStatusBar()
 
     const AuthSession& session = *state.session();
     const std::string tier = session.user.membership_tier_verified
-        ? session.user.membership_tier
+        ? Tr(session.user.membership_tier)
         : Tr("Unknown");
-    const std::string status = session.user.display_name + " | " + tier + " | " + settings.label;
+    const std::string status = session.user.display_name + " | " + tier + " | " + Tr(settings.label);
     if (status != displayed_status_)
     {
         status_label_->setText(status);

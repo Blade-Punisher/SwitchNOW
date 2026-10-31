@@ -26,6 +26,8 @@ struct CheckResult
 };
 
 using ProgressCallback = std::function<void(std::uint64_t, std::uint64_t)>;
+void SetExecutablePath(const std::string& path);
+const std::string& ExecutablePath();
 
 CheckResult CheckLatestRelease(const std::string& current_version);
 bool StageRelease(
@@ -34,8 +36,5 @@ bool StageRelease(
     std::string& error);
 bool LaunchUpdateHelper(std::string& error);
 void ConfirmInstalledUpdate();
-
-inline constexpr const char* kCanonicalNroPath =
-    "sdmc:/switch/SwitchNOW/SwitchNOW.nro";
 
 } // namespace opennow::update

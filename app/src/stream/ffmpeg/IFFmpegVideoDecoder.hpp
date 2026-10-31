@@ -16,6 +16,7 @@
 #define VIDEO_DECODER_PREFER_HARDWARE 0x01
 #define VIDEO_DECODER_FORCE_SOFTWARE 0x02
 #define VIDEO_DECODER_REQUIRE_HARDWARE 0x04
+#define VIDEO_DECODER_COPY_HARDWARE_FRAMES 0x08
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -64,6 +65,7 @@ class IFFmpegVideoDecoder {
     virtual int submit_decode_unit(uint8_t* indata, int inlen, int64_t pts = AV_NOPTS_VALUE) = 0;
     virtual int capabilities() const = 0;
     virtual VideoDecodeStats* video_decode_stats() = 0;
+    virtual bool uses_hardware_decoder() const = 0;
     virtual bool uses_hardware_frames() const = 0;
     virtual const std::string& setup_diagnostics() const = 0;
     virtual uint64_t corrupt_frames_dropped() const = 0;

@@ -15,5 +15,6 @@ int main(void)
     assert(packet[8] == 0x11 && packet[9] == 0x22 && packet[10] == 0x33 && packet[11] == 0x44);
     assert(packet[12] == 0x55 && packet[13] == 0x66);
     assert(packet[14] == 0xa5 && packet[15] == 0x5a);
+
     return 0;
 }

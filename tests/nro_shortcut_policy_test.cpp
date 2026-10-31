@@ -51,6 +51,16 @@ int main()
     assert(std::string(
         reinterpret_cast<const char*>(output.data() + new_romfs), romfs_size) == "romfs");
 
+    std::vector<std::uint8_t> unchanged;
+    assert(BuildShortcutNro(output, icon, "Control", unchanged));
+    assert(unchanged == output); // No SD write/reinstall for identical artwork.
+    const std::vector<std::uint8_t> larger_icon {0xFF, 0xD8, 1, 2, 3, 0xFF, 0xD9};
+    std::vector<std::uint8_t> refreshed;
+    assert(BuildShortcutNro(output, larger_icon, "Control", refreshed));
+    assert(refreshed != output);
+    assert(std::equal(output.begin(), output.begin() + executable_size, refreshed.begin()));
+    const auto moved_romfs = executable_size + detail::ReadU64(refreshed, executable_size + 0x28);
+    assert(std::string(reinterpret_cast<const char*>(refreshed.data() + moved_romfs), romfs_size) == "romfs");
     assert(!BuildShortcutNro({}, icon, "Bad", output));
     assert(!BuildShortcutNro(input, {}, "Bad", output));
     input[executable_size] = 0;

@@ -9,7 +9,9 @@
 #include "network_utils.hpp"
 #include "runtime_journal.hpp"
 #include "server_location_policy.hpp"
+#include "server_zone_policy.hpp"
 #include "stream_settings.hpp"
+#include "proxy_diagnostics.hpp"
 #include "stream_settings_policy.hpp"
 #include "stream_diagnostics.hpp"
 #include "subscription_display.hpp"
@@ -74,22 +76,22 @@ std::string FormatBytes(std::uint64_t bytes)
 std::string FormatTokenState(const AuthSession& session)
 {
     if (session.reauthentication_required)
-        return "reconnect required";
+        return Tr("reconnect required");
 
     if (!session.tokens.refresh_token.empty())
-        return "connected; automatic renewal enabled";
+        return Tr("connected; automatic renewal enabled");
 
     if (session.tokens.expires_at_ms <= 0)
-        return "connected for this launch";
+        return Tr("connected for this launch");
 
     const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
     const auto remaining_minutes = (session.tokens.expires_at_ms - now_ms) / 60000;
     if (remaining_minutes <= 0)
-        return "expired; reconnect required";
+        return Tr("expired; reconnect required");
     if (remaining_minutes < 60)
-        return "temporary login valid for " + std::to_string(remaining_minutes) + " min";
-    return "temporary login valid for " + std::to_string(remaining_minutes / 60) + " h";
+        return TrFormat("temporary login valid for {0} min",{std::to_string(remaining_minutes)});
+    return TrFormat("temporary login valid for {0} h",{std::to_string(remaining_minutes/60)});
 }
 
 ImageCacheInfo ReadImageCacheInfo()
@@ -173,9 +175,9 @@ std::string FileState(const std::string& path)
 {
     struct stat st {};
     if (stat(path.c_str(), &st) != 0)
-        return "missing";
+        return Tr("Unavailable");
 
-    return std::to_string(static_cast<long long>(st.st_size)) + " bytes";
+    return std::to_string(static_cast<long long>(st.st_size)) + Tr(" bytes");
 }
 
 bool SameSettings(const StreamSettings& left, const StreamSettings& right)
@@ -189,6 +191,11 @@ bool SameSettings(const StreamSettings& left, const StreamSettings& right)
            left.audio_buffer_ms == right.audio_buffer_ms &&
            left.video_backend == right.video_backend &&
            left.debug_diagnostics == right.debug_diagnostics &&
+           left.stats_overlay_enabled == right.stats_overlay_enabled &&
+           left.proxy_enabled == right.proxy_enabled &&
+           left.proxy_url == right.proxy_url &&
+           left.proxy_username == right.proxy_username &&
+           left.proxy_password == right.proxy_password &&
            left.game_language == right.game_language &&
            left.persist_game_settings == right.persist_game_settings &&
            left.controller_layout == right.controller_layout &&
@@ -210,16 +217,18 @@ SettingsTab::SettingsTab()
 
     auto* title_column = new brls::Box(brls::Axis::COLUMN);
     title_column->setGrow(1.0f);
-    auto* title = MakeParagraph("Settings", 3.0f);
+    auto* title = MakeParagraph(opennow::Tr("Settings"), 3.0f);
+    title_label_=title;
     title->setFontSize(30);
     title_column->addView(title);
-    auto* hint = MakeParagraph("Console-first controls. Press X to save, Y to revert.", 0.0f);
+    auto* hint = MakeParagraph(opennow::Tr("Console-first controls. Press X to save, Y to revert."), 0.0f);
+    hint_label_=hint;
     hint->setFontSize(15);
     hint->setTextColor(nvgRGB(142, 149, 160));
     title_column->addView(hint);
     top->addView(title_column);
 
-    save_status_ = MakeParagraph("All changes saved", 0.0f);
+    save_status_ = MakeParagraph(opennow::Tr("All changes saved"), 0.0f);
     save_status_->setFontSize(16);
     save_status_->setTextColor(nvgRGB(88, 230, 146));
     top->addView(save_status_);
@@ -235,7 +244,8 @@ SettingsTab::SettingsTab()
     sidebar->setCornerRadius(14);
     sidebar->setBackgroundColor(nvgRGB(15, 17, 21));
 
-    auto* nav_label = MakeParagraph("CATEGORIES", 12.0f);
+    auto* nav_label = MakeParagraph(opennow::Tr("CATEGORIES"), 12.0f);
+    nav_label_=nav_label;
     nav_label->setFontSize(13);
     nav_label->setTextColor(nvgRGB(108, 115, 126));
     sidebar->addView(nav_label);
@@ -265,7 +275,8 @@ SettingsTab::SettingsTab()
     }
 
     auto* nav_hint = MakeParagraph(
-        "Changes apply to the next stream. Account and cache actions run immediately.", 0.0f);
+        opennow::Tr("Changes apply to the next stream. Account and cache actions run immediately."), 0.0f);
+    nav_hint_=nav_hint;
     nav_hint->setFontSize(14);
     nav_hint->setTextColor(nvgRGB(124, 132, 144));
     nav_hint->setSingleLine(false);
@@ -276,10 +287,10 @@ SettingsTab::SettingsTab()
     content_shell->setGrow(1.0f);
     content_shell->setPadding(0, 6, 0, 6);
 
-    page_title_ = MakeParagraph("Stream", 2.0f);
+    page_title_ = MakeParagraph(opennow::Tr("Stream"), 2.0f);
     page_title_->setFontSize(27);
     content_shell->addView(page_title_);
-    page_subtitle_ = MakeParagraph("Tune quality, latency and decoder behavior.", 12.0f);
+    page_subtitle_ = MakeParagraph(opennow::Tr("Tune quality, latency and decoder behavior."), 12.0f);
     page_subtitle_->setFontSize(15);
     page_subtitle_->setTextColor(nvgRGB(142, 149, 160));
     content_shell->addView(page_subtitle_);
@@ -294,12 +305,12 @@ SettingsTab::SettingsTab()
     body->addView(content_shell);
     addView(body);
 
-    registerAction("Save", brls::BUTTON_X, [this](brls::View* view) {
+    registerAction(opennow::Tr("Save"), brls::BUTTON_X, [this](brls::View* view) {
         return RunUiAction("settings_save", [this, view] {
             SaveChanges(view);
         });
     }, false, true);
-    registerAction("Revert", brls::BUTTON_Y, [this](brls::View* view) {
+    registerAction(opennow::Tr("Revert"), brls::BUTTON_Y, [this](brls::View* view) {
         return RunUiAction("settings_revert", [this, view] {
             RevertChanges(view);
         });
@@ -344,7 +355,7 @@ brls::Box* SettingsTab::MakeOptionRow(
     std::function<bool(brls::View*)> action)
 {
     auto* row = new brls::Box(brls::Axis::ROW);
-    row->setHeight(72);
+    row->setHeight(90);
     row->setAlignItems(brls::AlignItems::CENTER);
     row->setPadding(8, 12, 8, 12);
     row->setMarginBottom(8);
@@ -365,6 +376,7 @@ brls::Box* SettingsTab::MakeOptionRow(
     auto* button = new brls::Button();
     button->setWidth(250);
     button->setHeight(50);
+    button->setFontSize(16);
     button->setCornerRadius(9);
     button->setText(Tr(value()));
     button->registerClickAction([this, action = std::move(action)](brls::View* view) {
@@ -385,7 +397,7 @@ brls::Box* SettingsTab::MakeActionRow(
     bool destructive)
 {
     auto* row = new brls::Box(brls::Axis::ROW);
-    row->setHeight(72);
+    row->setHeight(90);
     row->setAlignItems(brls::AlignItems::CENTER);
     row->setPadding(8, 12, 8, 12);
     row->setMarginBottom(8);
@@ -407,6 +419,7 @@ brls::Box* SettingsTab::MakeActionRow(
     auto* button = new brls::Button();
     button->setWidth(250);
     button->setHeight(50);
+    button->setFontSize(16);
     button->setCornerRadius(9);
     button->setText(Tr(button_text));
     button->registerClickAction(std::move(action));
@@ -432,7 +445,7 @@ brls::Label* SettingsTab::AddInfoLine(
     key->setFontSize(15);
     key->setTextColor(nvgRGB(139, 147, 158));
     row->addView(key);
-    auto* text = MakeParagraph(value, 0.0f);
+    auto* text = MakeParagraph(TrMessage(value), 0.0f);
     text->setFontSize(15);
     text->setTextColor(nvgRGB(210, 216, 225));
     row->addView(text);
@@ -555,43 +568,43 @@ void SettingsTab::ScheduleCategoryRebuild()
 void SettingsTab::BuildAccountPage()
 {
     const auto& state = AppState::Instance();
-    auto* overview = MakeSection("Connected account", "Authentication is renewed automatically when NVIDIA permits it.");
+    auto* overview = MakeSection(opennow::Tr("Connected account"), opennow::Tr("Authentication is renewed automatically when NVIDIA permits it."));
     if (!state.HasSession())
     {
-        AddInfoLine(overview, "Status", "Not connected");
-        AddInfoLine(overview, "Next step", "Sign in from Library");
+        AddInfoLine(overview, opennow::Tr("Status"), opennow::Tr("Not connected"));
+        AddInfoLine(overview, opennow::Tr("Next step"), opennow::Tr("Sign in from Library"));
     }
     else
     {
         const AuthSession& session = *state.session();
         const bool password_saved = client_.LoadNativeCredentials(session.provider.idp_id).has_value();
-        AddInfoLine(overview, "User", session.user.display_name);
+        AddInfoLine(overview, opennow::Tr("User"), session.user.display_name);
         auto* membership_value = AddInfoLine(
             overview,
-            "Membership",
+            opennow::Tr("Membership"),
             session.user.membership_tier_verified
-                ? session.user.membership_tier
+                ? Tr(session.user.membership_tier)
                 : Tr("Unknown"));
         membership_value->setTextColor(membership::TextColor(
             session.user.membership_tier_verified
                 ? session.user.membership_tier
                 : std::string {}));
-        AddInfoLine(overview, "Provider", session.provider.display_name);
-        AddInfoLine(overview, "Authentication", FormatTokenState(session));
-        AddInfoLine(overview, "Quick sign-in", password_saved ? "Password saved" : "Password not saved");
+        AddInfoLine(overview, opennow::Tr("Provider"), session.provider.display_name);
+        AddInfoLine(overview, opennow::Tr("Authentication"), FormatTokenState(session));
+        AddInfoLine(overview, opennow::Tr("Quick sign-in"), password_saved ? opennow::Tr("Password saved") : opennow::Tr("Password not saved"));
     }
-    AddInfoLine(overview, "Saved accounts", std::to_string(client_.LoadSavedSessions().size()));
+    AddInfoLine(overview, opennow::Tr("Saved accounts"), std::to_string(client_.LoadSavedSessions().size()));
     content_container_->addView(overview);
 
     if (state.HasSession())
     {
         const AuthSession& active = *state.session();
         auto* subscription_section = MakeSection(
-            "GeForce NOW subscription",
-            "Usage information reported by NVIDIA for this account.");
+            opennow::Tr("GeForce NOW subscription"),
+            opennow::Tr("Usage information reported by NVIDIA for this account."));
         auto* tier_value = AddInfoLine(
             subscription_section,
-            "Service level",
+            opennow::Tr("Service level"),
             active.user.membership_tier_verified
                 ? active.user.membership_tier
                 : Tr("Unknown"));
@@ -601,43 +614,43 @@ void SettingsTab::BuildAccountPage()
                 : std::string {}));
         AddInfoLine(
             subscription_section,
-            "Time remaining",
+            opennow::Tr("Time remaining"),
             subscription::FormatTimeRemaining(active.subscription));
         AddInfoLine(
             subscription_section,
-            "Cloud storage remaining",
+            opennow::Tr("Cloud storage remaining"),
             subscription::FormatStorageRemaining(active.subscription));
         if (active.subscription.has_storage)
         {
             AddInfoLine(
                 subscription_section,
-                "Cloud storage usage",
+                opennow::Tr("Cloud storage usage"),
                 subscription::FormatStorageUsage(active.subscription));
         }
         content_container_->addView(subscription_section);
     }
 
-    auto* session = MakeSection("Session", "Account actions take effect immediately and do not require X.");
+    auto* session = MakeSection(opennow::Tr("Session"), opennow::Tr("Account actions take effect immediately and do not require X."));
     session->addView(MakeActionRow(
-        "Session details", "Identity, membership, provider and token lifetime.", "View",
+        opennow::Tr("Session details"), opennow::Tr("Identity, membership, provider and token lifetime."), opennow::Tr("View"),
         [this](brls::View* view) { return ShowSessionDialog(view); }));
     session->addView(MakeActionRow(
-        "Refresh authorization", "Renew the token and rotate the encrypted vault now.", "Refresh",
+        opennow::Tr("Refresh authorization"), opennow::Tr("Renew the token and rotate the encrypted vault now."), opennow::Tr("Refresh"),
         [this](brls::View* view) { return TestTokenRefresh(view); }));
     session->addView(MakeActionRow(
-        "Choose saved account", "Switch profiles without repeating sign-in.", "Choose",
+        opennow::Tr("Choose saved account"), opennow::Tr("Switch profiles without repeating sign-in."), opennow::Tr("Choose"),
         [this](brls::View* view) { return SwitchSavedAccount(view); }));
     session->addView(MakeActionRow(
-        "Forget saved passwords", "Keep OAuth sessions, remove quick-login credentials.", "Forget",
+        opennow::Tr("Forget saved passwords"), opennow::Tr("Keep OAuth sessions, remove quick-login credentials."), opennow::Tr("Forget"),
         [this](brls::View* view) { return ClearSavedPasswords(view); }));
     content_container_->addView(session);
 
-    auto* danger = MakeSection("Account removal", "These actions also clear the matching cached library state.");
+    auto* danger = MakeSection(opennow::Tr("Account removal"), opennow::Tr("These actions also clear the matching cached library state."));
     danger->addView(MakeActionRow(
-        "Remove active account", "Disconnect the current account and select another saved profile.", "Remove",
+        opennow::Tr("Remove active account"), opennow::Tr("Disconnect the current account and select another saved profile."), opennow::Tr("Remove"),
         [this](brls::View* view) { return ClearSavedLogin(view); }, true));
     danger->addView(MakeActionRow(
-        "Remove every account", "Delete all saved sessions and passwords from this console.", "Remove all",
+        opennow::Tr("Remove every account"), opennow::Tr("Delete all saved sessions and passwords from this console."), opennow::Tr("Remove all"),
         [this](brls::View* view) { return ClearAllSavedLogins(view); }, true));
     content_container_->addView(danger);
 }
@@ -645,106 +658,126 @@ void SettingsTab::BuildAccountPage()
 void SettingsTab::BuildStreamPage()
 {
     auto* location = MakeSection(
-        "Server location",
-        "Use automatic routing or choose a specific GeForce NOW data center.");
+        opennow::Tr("Server location"),
+        opennow::Tr("Use automatic routing or choose a specific GeForce NOW data center."));
     location->addView(MakeOptionRow(
-        "Location",
-        "Locations are ranked by direct latency from this console.",
+        opennow::Tr("Location"),
+        opennow::Tr("Auto balances connection quality and fresh queue estimates. Closest prioritizes ping."),
         [this] { return ServerLocationValue(); },
         [this](brls::View* view) { return ChooseServerLocation(view); }));
     location->addView(MakeActionRow(
-        "Latency test",
-        "Reload available locations and test each connection again.",
-        "Refresh",
+        opennow::Tr("Latency test"),
+        opennow::Tr("Reload available locations and test each connection again."),
+        opennow::Tr("Refresh"),
         [this](brls::View* view) { return RefreshServerLocations(view); }));
     content_container_->addView(location);
 
-    auto* quality = MakeSection("Quality profile", "Start with a preset, then fine-tune individual values.");
+    auto* connection = MakeSection(opennow::Tr("Proxy"), opennow::Tr("Your proxy handles CloudMatch session requests. Video, audio and input stay direct."));
+    connection->addView(MakeOptionRow(opennow::Tr("Use proxy"), opennow::Tr("Enter your proxy address, then enable and save with X."),
+        [this] { return draft_settings_.proxy_enabled ? std::string("Enabled") : std::string("Disabled"); },
+        [this](brls::View* view) { return ToggleProxy(view); }));
+    connection->addView(MakeOptionRow(opennow::Tr("Proxy address"), opennow::Tr("HTTP, SOCKS5 or SOCKS5h. Include host and port; enter credentials below."),
+        [this] { return draft_settings_.proxy_url.empty() ? std::string("Not configured") : draft_settings_.proxy_url; },
+        [this](brls::View* view) { return EditProxy(view, 0); }));
+    connection->addView(MakeOptionRow(opennow::Tr("Proxy username"), opennow::Tr("Optional authentication."),
+        [this] { return draft_settings_.proxy_username.empty() ? std::string("Not configured") : std::string("Configured"); },
+        [this](brls::View* view) { return EditProxy(view, 1); }));
+    connection->addView(MakeOptionRow(opennow::Tr("Proxy password"), opennow::Tr("Leave empty to clear. Saved on this SD card."),
+        [this] { return draft_settings_.proxy_password.empty() ? std::string("Not configured") : std::string("********"); },
+        [this](brls::View* view) { return EditProxy(view, 2); }));
+    content_container_->addView(connection);
+
+    auto* quality = MakeSection(opennow::Tr("Quality profile"), opennow::Tr("Start with a preset, then fine-tune individual values."));
     quality->addView(MakeOptionRow(
-        "Preset", "Safe, Balanced or Quality baseline.",
+        opennow::Tr("Preset"), opennow::Tr("Safe, Balanced or Quality baseline."),
         [this] { return draft_settings_.label; },
         [this](brls::View* view) { return CycleStreamPreset(view); }));
     quality->addView(MakeOptionRow(
-        "Resolution", "720p reduces load; 1080p improves detail.",
+        opennow::Tr("Resolution"), opennow::Tr("720p reduces load; 1080p improves detail."),
         [this] { return std::to_string(draft_settings_.width) + " x " + std::to_string(draft_settings_.height); },
         [this](brls::View* view) { return CycleResolution(view); }));
     quality->addView(MakeOptionRow(
-        "Frame rate", "60 FPS is smoother; 30 FPS is more resilient.",
+        opennow::Tr("Frame rate"), opennow::Tr("60 FPS is smoother; 30 FPS is more resilient."),
         [this] { return std::to_string(draft_settings_.fps) + " FPS"; },
         [this](brls::View* view) { return CycleFrameRate(view); }));
     quality->addView(MakeOptionRow(
-        "Maximum bitrate", "Higher values improve motion detail but need stronger Wi-Fi.",
+        opennow::Tr("Maximum bitrate"), opennow::Tr("Higher values improve motion detail but need stronger Wi-Fi."),
         [this] { return std::to_string(draft_settings_.bitrate_kbps / 1000) + " Mbps"; },
         [this](brls::View* view) { return CycleBitrate(view); }));
     quality->addView(MakeOptionRow(
-        "Motion clarity",
-        "Adaptive balances recovery and detail; Clarity adds stronger cleanup; Original disables enhancement.",
-        [this] { return draft_settings_.image_quality_mode; },
+        opennow::Tr("Streaming mode"),
+        opennow::Tr("Performance prioritizes response; Balanced adapts delivery; Quality favors detail. Resolution and FPS stay configurable."),
+        [this] { return Tr(draft_settings_.image_quality_mode); },
         [this](brls::View* view) { return CycleImageQuality(view); }));
     content_container_->addView(quality);
 
-    auto* decoder = MakeSection("Decoder & delivery", "Auto uses Tegra X1 NVDEC and falls back to software when needed.");
+    auto* decoder = MakeSection(opennow::Tr("Decoder & delivery"), opennow::Tr("Auto uses NVDEC with a stable copied frame; NVDEC enables experimental zero-copy."));
     decoder->addView(MakeOptionRow(
-        "Video backend", "Choose automatic fallback, hardware-only or software-only decode.",
+        opennow::Tr("Video backend"), opennow::Tr("Choose safe automatic NVDEC, experimental zero-copy, or software decode."),
         [this] { return draft_settings_.video_backend; },
         [this](brls::View* view) { return CycleVideoBackend(view); }));
-    AddInfoLine(decoder, "Codec", "H.264, 8-bit 4:2:0");
+    AddInfoLine(decoder, opennow::Tr("Codec"), opennow::Tr("H.264, 8-bit 4:2:0"));
     content_container_->addView(decoder);
 
-    auto* defaults = MakeSection("Recovery", "A known-good baseline for Nintendo Switch hardware.");
+    auto* defaults = MakeSection(opennow::Tr("Recovery"), opennow::Tr("A known-good baseline for Nintendo Switch hardware."));
     defaults->addView(MakeActionRow(
-        "Restore Balanced defaults", "720p, 60 FPS, 12 Mbps, automatic NVDEC fallback.", "Restore",
+        opennow::Tr("Restore Balanced defaults"), opennow::Tr("720p, 60 FPS, 12 Mbps, safe automatic NVDEC."), opennow::Tr("Restore"),
         [this](brls::View* view) { return ResetStreamPreset(view); }));
     content_container_->addView(defaults);
 
     auto* diagnostics = MakeSection(
-        "Diagnostics",
-        "Disabled by default to avoid file I/O and keep the stream screen clean.");
+        opennow::Tr("Diagnostics"),
+        opennow::Tr("Disabled by default to avoid file I/O and keep the stream screen clean."));
     diagnostics->addView(MakeOptionRow(
-        "Debug diagnostics",
-        "Show pre-stream telemetry and IN/DEC/OUT, and record detailed auth, session, stream, input, audio, render and UI logs.",
+        opennow::Tr("Debug diagnostics"),
+        opennow::Tr("Show pre-stream telemetry and IN/DEC/OUT, and record detailed auth, session, stream, input, audio, render and UI logs."),
         [this] { return draft_settings_.debug_diagnostics ? std::string("Enabled") : std::string("Disabled"); },
         [this](brls::View* view) { return ToggleDebugDiagnostics(view); }));
+    diagnostics->addView(MakeOptionRow(
+        opennow::Tr("Stream statistics"),
+        opennow::Tr("Show FPS, bitrate, ping, packet loss and connection state during play."),
+        [this] { return draft_settings_.stats_overlay_enabled ? std::string("Enabled") : std::string("Disabled"); },
+        [this](brls::View* view) { return ToggleStatsOverlay(view); }));
     content_container_->addView(diagnostics);
 }
 
 void SettingsTab::BuildAudioPage()
 {
-    auto* output = MakeSection("Stream audio", "Audio remains synchronized with the currently presented video frame.");
+    auto* output = MakeSection(opennow::Tr("Stream audio"), opennow::Tr("Audio remains synchronized with the currently presented video frame."));
     output->addView(MakeOptionRow(
-        "Audio output", "Enable or mute GeForce NOW audio.",
+        opennow::Tr("Audio output"), opennow::Tr("Enable or mute GeForce NOW audio."),
         [this] { return draft_settings_.audio_enabled ? std::string("Enabled") : std::string("Muted"); },
         [this](brls::View* view) { return ToggleAudio(view); }));
     output->addView(MakeOptionRow(
-        "Volume boost", "Compensates for NVIDIA's quiet decoded PCM level.",
+        opennow::Tr("Volume boost"), opennow::Tr("Compensates for NVIDIA's quiet decoded PCM level."),
         [this] { return std::to_string(draft_settings_.audio_volume / 100) + "x"; },
         [this](brls::View* view) { return CycleAudioVolume(view); }));
     output->addView(MakeOptionRow(
-        "Playback buffer", "A larger buffer resists crackle but adds a little latency.",
+        opennow::Tr("Playback buffer"), opennow::Tr("A larger buffer resists crackle but adds a little latency."),
         [this] { return std::to_string(draft_settings_.audio_buffer_ms) + " ms"; },
         [this](brls::View* view) { return CycleAudioBuffer(view); }));
     content_container_->addView(output);
 
-    auto* format = MakeSection("Output format", "Selected automatically for Switch Audren.");
-    AddInfoLine(format, "Source", "Opus stereo");
-    AddInfoLine(format, "Mixer", "48 kHz PCM");
-    AddInfoLine(format, "Synchronization", "RTCP video clock");
+    auto* format = MakeSection(opennow::Tr("Output format"), opennow::Tr("Selected automatically for Switch Audren."));
+    AddInfoLine(format, opennow::Tr("Source"), opennow::Tr("Opus stereo"));
+    AddInfoLine(format, opennow::Tr("Mixer"), opennow::Tr("48 kHz PCM"));
+    AddInfoLine(format, opennow::Tr("Synchronization"), opennow::Tr("RTCP video clock"));
     content_container_->addView(format);
 }
 
 void SettingsTab::BuildGamePage()
 {
     auto* game = MakeSection(
-        "Game preferences",
-        "These values are sent to NVIDIA when a new GeForce NOW session is created.");
+        opennow::Tr("Game preferences"),
+        opennow::Tr("These values are sent to NVIDIA when a new GeForce NOW session is created."));
     game->addView(MakeOptionRow(
-        "Game language",
-        "Language for in-game menus, subtitles and audio when the game supports it.",
+        opennow::Tr("Game language"),
+        opennow::Tr("Language for in-game menus, subtitles and audio when the game supports it."),
         [this] { return GameLanguageLabel(draft_settings_.game_language); },
         [this](brls::View* view) { return ChooseGameLanguage(view); }));
     game->addView(MakeOptionRow(
-        "Save in-game graphics settings",
-        "Allow supported games to retain graphics options changed inside the stream.",
+        opennow::Tr("Save in-game graphics settings"),
+        opennow::Tr("Allow supported games to retain graphics options changed inside the stream."),
         [this] {
             return draft_settings_.persist_game_settings
                 ? std::string("Enabled")
@@ -757,21 +790,21 @@ void SettingsTab::BuildGamePage()
 void SettingsTab::BuildControlsPage()
 {
     auto* layout = MakeSection(
-        "Controller layout",
-        "Only ABXY changes. Sticks, triggers, D-pad, hotkeys and system actions keep their current mapping.");
+        opennow::Tr("Controller layout"),
+        opennow::Tr("Only ABXY changes. Sticks, triggers, D-pad, hotkeys and system actions keep their current mapping."));
     layout->addView(MakeOptionRow(
-        "Face buttons",
-        "Xbox keeps the current positional layout; Switch makes physical labels match the remote buttons.",
+        opennow::Tr("Face buttons"),
+        opennow::Tr("Xbox keeps the current positional layout; Switch makes physical labels match the remote buttons."),
         [this] { return draft_settings_.controller_layout; },
         [this](brls::View* view) { return ToggleControllerLayout(view); }));
     AddInfoLine(
         layout,
-        "Xbox mode",
-        "Switch A/B/X/Y -> Xbox B/A/Y/X");
+        opennow::Tr("Xbox mode"),
+        opennow::Tr("Switch A/B/X/Y -> Xbox B/A/Y/X"));
     AddInfoLine(
         layout,
-        "Switch mode",
-        "Switch A/B/X/Y -> Xbox A/B/X/Y");
+        opennow::Tr("Switch mode"),
+        opennow::Tr("Switch A/B/X/Y -> Xbox A/B/X/Y"));
     content_container_->addView(layout);
 }
 
@@ -779,54 +812,57 @@ void SettingsTab::BuildStoragePage()
 {
     const auto& state = AppState::Instance();
     const ImageCacheInfo images = ReadImageCacheInfo();
-    auto* cache = MakeSection("Cover cache", "Artwork is stored on the SD card to keep the library responsive.");
-    AddInfoLine(cache, "Cover files", std::to_string(images.files));
-    AddInfoLine(cache, "Disk usage", FormatBytes(images.bytes));
-    AddInfoLine(cache, "Public catalog", state.HasPublicGames() ? "Loaded" : "Not loaded");
-    AddInfoLine(cache, "Owned library", state.HasLibraryGames() ? "Loaded" : "Not loaded");
+    auto* cache = MakeSection(opennow::Tr("Cover cache"), opennow::Tr("Artwork is stored on the SD card to keep the library responsive."));
+    AddInfoLine(cache, opennow::Tr("Cover files"), std::to_string(images.files));
+    AddInfoLine(cache, opennow::Tr("Disk usage"), FormatBytes(images.bytes));
+    AddInfoLine(cache, opennow::Tr("Public catalog"), state.HasPublicGames() ? opennow::Tr("Loaded") : opennow::Tr("Not loaded"));
+    AddInfoLine(cache, opennow::Tr("Owned library"), state.HasLibraryGames() ? opennow::Tr("Loaded") : opennow::Tr("Not loaded"));
     cache->addView(MakeActionRow(
-        "Inspect shared cache", "Show provider, catalog, library and artwork state.", "Inspect",
+        opennow::Tr("Inspect shared cache"), opennow::Tr("Show provider, catalog, library and artwork state."), opennow::Tr("Inspect"),
         [this](brls::View* view) { return ShowCacheState(view); }));
     cache->addView(MakeActionRow(
-        "Clear cover artwork", "Remove downloaded covers; they will be fetched again on demand.", "Clear",
+        opennow::Tr("Clear cover artwork"), opennow::Tr("Remove downloaded covers; they will be fetched again on demand."), opennow::Tr("Clear"),
         [this](brls::View* view) { return ClearCoverCache(view); }, true));
     content_container_->addView(cache);
 
-    auto* system = MakeSection("System", "Information useful when diagnosing a hardware or network problem.");
-    AddInfoLine(system, "Applet mode", AppletTypeName());
-    AddInfoLine(system, "Local IP", NetworkUtils::GetLocalIPAddress());
+    auto* system = MakeSection(opennow::Tr("System"), opennow::Tr("Information useful when diagnosing a hardware or network problem."));
+    AddInfoLine(system, opennow::Tr("Applet mode"), AppletTypeName());
+    AddInfoLine(system, opennow::Tr("Local IP"), NetworkUtils::GetLocalIPAddress());
     system->addView(MakeActionRow(
-        "Open diagnostics", "Inspect runtime mode, stream settings, logs and storage paths.", "Open",
+        opennow::Tr("Open diagnostics"), opennow::Tr("Inspect runtime mode, stream settings, logs and storage paths."), opennow::Tr("Open"),
         [this](brls::View* view) { return ShowDiagnostics(view); }));
+    system->addView(MakeActionRow(
+        opennow::Tr("Save diagnostic report"), opennow::Tr("Save filtered logs and session metrics to an SD card ZIP. No upload."), opennow::Tr("Save"),
+        [](brls::View*) { SaveDiagnosticReportDialog(); return true; }));
     content_container_->addView(system);
 }
 
 void SettingsTab::BuildInterfacePage()
 {
     auto* language = MakeSection(
-        "Language",
-        "Choose the launcher language.");
+        opennow::Tr("Language"),
+        opennow::Tr("Choose the launcher language."));
     language->addView(MakeOptionRow(
-        "Language",
-        "Choose the launcher language.",
+        opennow::Tr("Language"),
+        opennow::Tr("Choose the launcher language."),
         [this] { return InterfaceLanguageLabel(draft_settings_.interface_language); },
         [this](brls::View* view) { return ChooseInterfaceLanguage(view); }));
     content_container_->addView(language);
 
     auto* updates = MakeSection(
-        "Updates",
-        "Updates are checked only when you choose this action.");
-    AddInfoLine(updates, "Installed version", kAppVersion);
+        opennow::Tr("Updates"),
+        opennow::Tr("Updates are checked only when you choose this action."));
+    AddInfoLine(updates, opennow::Tr("Installed version"), kAppVersion);
     updates->addView(MakeActionRow(
-        "Check for updates",
-        "Check the official SwitchNOW GitHub release and install a newer NRO safely.",
-        "Check",
+        opennow::Tr("Check for updates"),
+        opennow::Tr("Check the official SwitchNOW GitHub release and install a newer NRO safely."),
+        opennow::Tr("Check"),
         [this](brls::View* view) { return CheckForUpdates(view); }));
     content_container_->addView(updates);
 
-    auto* about = MakeSection("SwitchNOW", "Native GeForce NOW client for Nintendo Switch.");
-    AddInfoLine(about, "Version", kAppVersion);
-    AddInfoLine(about, "Languages", "English + 7");
+    auto* about = MakeSection("SwitchNOW", opennow::Tr("Native GeForce NOW client for Nintendo Switch."));
+    AddInfoLine(about, opennow::Tr("Version"), kAppVersion);
+    AddInfoLine(about, opennow::Tr("Languages"), opennow::Tr("English + 7"));
     content_container_->addView(about);
 }
 
@@ -890,21 +926,9 @@ bool SettingsTab::CheckForUpdates(brls::View* view)
                                     return;
                                 }
 
-                                auto* ready = new brls::Dialog(
-                                    Tr("Update ready") + "\n\n" +
-                                    TrFormat(
-                                        "Version {0} was downloaded and verified. SwitchNOW will return to HOME while the update is installed.",
-                                        {release.version}));
-                                ready->addButton(Tr("Install update"), [] {
-                                    std::string launch_error;
-                                    if (!update::LaunchUpdateHelper(launch_error))
-                                        ShowError(
-                                            Tr("Update installation failed"),
-                                            launch_error);
-                                });
-                                ready->addButton(Tr("Later"), [] {});
-                                ready->setCancelable(true);
-                                ready->open();
+                                std::string launch_error;
+                                if (!update::LaunchUpdateHelper(launch_error))
+                                    ShowError(Tr("Update installation failed"), launch_error);
                             });
                         },
                         false);
@@ -938,19 +962,24 @@ bool SettingsTab::SaveChanges(brls::View* view)
     (void)view;
     if (!settings_loaded_ || !dirty_)
     {
-        brls::Application::notify("Settings are already up to date");
+        brls::Application::notify(opennow::Tr("Settings are already up to date"));
         return true;
     }
 
     if (!SaveStreamSettings(draft_settings_))
     {
-        ShowError("Settings Save Failed", "Could not safely write stream_settings.json to the SD card.");
+        ShowError(opennow::Tr("Settings Save Failed"), opennow::Tr("Could not safely write stream_settings.json to the SD card."));
         return true;
     }
 
     saved_settings_ = LoadStreamSettings();
+    proxy_diagnostics::Configuration(saved_settings_);
     draft_settings_ = saved_settings_;
     SetInterfaceLanguage(saved_settings_.interface_language);
+    title_label_->setText(Tr("Settings"));
+    hint_label_->setText(Tr("Console-first controls. Press X to save, Y to revert."));
+    nav_label_->setText(Tr("CATEGORIES"));
+    nav_hint_->setText(Tr("Changes apply to the next stream. Account and cache actions run immediately."));
     SetStreamDiagnosticsEnabled(saved_settings_.debug_diagnostics);
     dirty_ = false;
     RefreshSummary();
@@ -1054,23 +1083,23 @@ bool SettingsTab::ShowSessionDialog(brls::View* view)
     if (!state.HasSession())
     {
         ShowDialog(
-            "Session Details",
-            "No saved GeForce NOW login is available on this Switch.");
+            opennow::Tr("Session Details"),
+            opennow::Tr("No saved GeForce NOW login is available on this Switch."));
         return true;
     }
 
     const AuthSession& session = *state.session();
     ShowDialog(
-        "Session Details",
-        "User: " + session.user.display_name + "\n" +
-            "Email: " + (session.user.email.empty() ? std::string("Unavailable") : session.user.email) + "\n" +
-            "Tier: " + (session.user.membership_tier_verified
-                ? session.user.membership_tier
+        opennow::Tr("Session Details"),
+        opennow::Tr("User: ") + session.user.display_name + "\n" +
+            opennow::Tr("Email: ") + (session.user.email.empty() ? std::string(opennow::Tr("Unavailable")) : session.user.email) + "\n" +
+            opennow::Tr("Tier: ") + (session.user.membership_tier_verified
+                ? Tr(session.user.membership_tier)
                 : Tr("Unknown")) + "\n" +
-            "Provider: " + session.provider.display_name + "\n" +
-            "Authentication: " + FormatTokenState(session) + "\n" +
-            "Streaming base: " + session.provider.streaming_service_url + "\n" +
-            "Saved accounts: " + std::to_string(client_.LoadSavedSessions().size()));
+            opennow::Tr("Provider: ") + session.provider.display_name + "\n" +
+            opennow::Tr("Authentication: ") + FormatTokenState(session) + "\n" +
+            opennow::Tr("Streaming base: ") + session.provider.streaming_service_url + "\n" +
+            opennow::Tr("Saved accounts: ") + std::to_string(client_.LoadSavedSessions().size()));
     return true;
 }
 
@@ -1080,7 +1109,7 @@ bool SettingsTab::TestTokenRefresh(brls::View* view)
     auto& state = AppState::Instance();
     if (!state.HasSession())
     {
-        ShowDialog("Token Refresh Test", "No GeForce NOW account is connected.");
+        ShowDialog(opennow::Tr("Token Refresh Test"), opennow::Tr("No GeForce NOW account is connected."));
         return true;
     }
 
@@ -1091,7 +1120,7 @@ bool SettingsTab::TestTokenRefresh(brls::View* view)
         state.SetSession(std::move(refreshed));
         RefreshSummary();
         ScheduleCategoryRebuild();
-        brls::Application::notify("Token refresh and vault rotation completed successfully");
+        brls::Application::notify(opennow::Tr("Token refresh and vault rotation completed successfully"));
     }
     catch (const ReauthenticationRequired& e)
     {
@@ -1100,11 +1129,11 @@ bool SettingsTab::TestTokenRefresh(brls::View* view)
         state.SetSession(std::move(invalid));
         RefreshSummary();
         ScheduleCategoryRebuild();
-        ShowError("Token Refresh Requires Login", e.what());
+        ShowError(opennow::Tr("Token Refresh Requires Login"), e.what());
     }
     catch (const std::exception& e)
     {
-        ShowError("Token Refresh Test Failed", e.what());
+        ShowError(opennow::Tr("Token Refresh Test Failed"), e.what());
     }
     return true;
 }
@@ -1128,12 +1157,12 @@ bool SettingsTab::ClearSavedLogin(brls::View* view)
     if (client_.LoadSavedSession(next))
     {
         state.SetSession(std::move(next));
-        brls::Application::notify("Active login cleared; switched to another saved account");
+        brls::Application::notify(opennow::Tr("Active login cleared; switched to another saved account"));
     }
     else
     {
         state.ClearSession();
-        brls::Application::notify("Saved GeForce NOW login cleared");
+        brls::Application::notify(opennow::Tr("Saved GeForce NOW login cleared"));
     }
 
     RefreshSummary();
@@ -1148,22 +1177,22 @@ bool SettingsTab::SwitchSavedAccount(brls::View* view)
     std::vector<AuthSession> sessions = client_.LoadSavedSessions();
     if (sessions.empty())
     {
-        ShowDialog("Saved Accounts", "No saved GeForce NOW accounts are available.");
+        ShowDialog(opennow::Tr("Saved Accounts"), opennow::Tr("No saved GeForce NOW accounts are available."));
         return true;
     }
 
     const std::string active_user_id =
         AppState::Instance().HasSession() ? AppState::Instance().session()->user.user_id : "";
 
-    auto* dialog = new brls::Dialog("Choose the GeForce NOW account to use.");
+    auto* dialog = new brls::Dialog(opennow::Tr("Choose the GeForce NOW account to use."));
     for (const AuthSession& session : sessions)
     {
         const bool active = session.user.user_id == active_user_id;
-        const std::string label = (active ? "Active: " : "Use: ") + session.user.display_name;
+        const std::string label = (active ? Tr("Active: ") : Tr("Use: ")) + session.user.display_name;
         dialog->addButton(label, [this, session]() {
             if (!client_.SetActiveSavedSession(session.user.user_id))
             {
-                ShowError("Account Switch Failed", "Unable to activate the selected saved account.");
+                ShowError(opennow::Tr("Account Switch Failed"), opennow::Tr("Unable to activate the selected saved account."));
                 return;
             }
 
@@ -1172,10 +1201,10 @@ bool SettingsTab::SwitchSavedAccount(brls::View* view)
             state.SetLibraryGames({});
             RefreshSummary();
             ScheduleCategoryRebuild();
-            brls::Application::notify("Switched to " + session.user.display_name);
+            brls::Application::notify(opennow::Tr("Switched to ") + session.user.display_name);
         });
     }
-    dialog->addButton("Cancel", [] {});
+    dialog->addButton(opennow::Tr("Cancel"), [] {});
     dialog->open();
     return true;
 }
@@ -1191,7 +1220,7 @@ bool SettingsTab::ClearAllSavedLogins(brls::View* view)
     state.SetLibraryGames({});
     RefreshSummary();
     ScheduleCategoryRebuild();
-    brls::Application::notify("All saved GeForce NOW logins cleared");
+    brls::Application::notify(opennow::Tr("All saved GeForce NOW logins cleared"));
     return true;
 }
 
@@ -1200,7 +1229,7 @@ bool SettingsTab::ClearSavedPasswords(brls::View* view)
     (void)view;
     client_.ClearAllNativeCredentials();
     ScheduleCategoryRebuild();
-    brls::Application::notify("All saved NVIDIA passwords were removed; OAuth sessions remain connected");
+    brls::Application::notify(opennow::Tr("All saved NVIDIA passwords were removed; OAuth sessions remain connected"));
     return true;
 }
 
@@ -1211,12 +1240,12 @@ bool SettingsTab::ShowCacheState(brls::View* view)
     const auto& state = AppState::Instance();
     const ImageCacheInfo images = ReadImageCacheInfo();
     ShowDialog(
-        "Shared Cache",
-        "Providers cached: " + std::string(state.HasProviders() ? "yes" : "no") + "\n" +
-            "Public catalog cached: " + std::string(state.HasPublicGames() ? "yes" : "no") + "\n" +
-            "Library cached: " + std::string(state.HasLibraryGames() ? "yes" : "no") + "\n" +
-            "Cover files: " + std::to_string(images.files) + "\n" +
-            "Cover cache size: " + FormatBytes(images.bytes));
+        opennow::Tr("Shared Cache"),
+        opennow::Tr("Providers cached: ") + std::string(state.HasProviders() ? opennow::Tr("yes") : opennow::Tr("no")) + "\n" +
+            opennow::Tr("Public catalog cached: ") + std::string(state.HasPublicGames() ? opennow::Tr("yes") : opennow::Tr("no")) + "\n" +
+            opennow::Tr("Library cached: ") + std::string(state.HasLibraryGames() ? opennow::Tr("yes") : opennow::Tr("no")) + "\n" +
+            opennow::Tr("Cover files: ") + std::to_string(images.files) + "\n" +
+            opennow::Tr("Cover cache size: ") + FormatBytes(images.bytes));
     return true;
 }
 
@@ -1227,41 +1256,25 @@ bool SettingsTab::ClearCoverCache(brls::View* view)
     const size_t removed = ClearImageCacheFiles();
     RefreshSummary();
     ScheduleCategoryRebuild();
-    brls::Application::notify("Removed " + std::to_string(removed) + " cached cover files");
+    brls::Application::notify(opennow::Tr("Removed ") + std::to_string(removed) + opennow::Tr(" cached cover files"));
     return true;
 }
 
 std::string SettingsTab::ServerLocationValue() const
 {
-    if (server_locations_loading_)
-        return Tr("Testing locations...");
-
-    const auto best = std::find_if(
-        server_locations_.begin(),
-        server_locations_.end(),
-        [](const StreamRegion& region) { return region.ping_ms >= 0; });
-
-    if (server_location::IsAutomatic(draft_settings_.region))
-    {
-        if (best == server_locations_.end())
-            return Tr("Auto (best)");
-        return Tr("Auto") + " - " + best->name + " - ~" +
-            std::to_string(best->ping_ms) + " ms";
-    }
-
-    const auto selected = std::find_if(
-        server_locations_.begin(),
-        server_locations_.end(),
-        [this](const StreamRegion& region) {
-            return region.url == draft_settings_.region;
-        });
-    if (selected == server_locations_.end())
-        return Tr("Selected server");
-
-    std::string value = selected->name;
-    if (selected->ping_ms >= 0)
-        value += " - ~" + std::to_string(selected->ping_ms) + " ms";
-    return value;
+    if (server_locations_loading_) return Tr("Testing locations...");
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    const bool automatic = server_location::IsAutomatic(draft_settings_.region);
+    const auto url = automatic ? server_zone::Select(server_locations_, draft_settings_.region, now) : draft_settings_.region;
+    const auto selected = std::find_if(server_locations_.begin(), server_locations_.end(),
+        [&](const auto& r) { return r.url == url; });
+    std::string prefix = server_location::IsClosest(draft_settings_.region)
+        ? Tr("Closest (lowest ping)") : Tr("Auto (best)");
+    if (selected == server_locations_.end()) return automatic ? prefix : Tr("Selected server");
+    std::string result = automatic ? prefix + " - " + selected->name : selected->name;
+    if (selected->ping_ms >= 0) result += " - ~" + std::to_string(selected->ping_ms) + " ms";
+    return result;
 }
 
 void SettingsTab::BeginServerLocationLoad(
@@ -1364,7 +1377,7 @@ void SettingsTab::BeginServerLocationLoad(
                     });
 
                 regions =
-                    client.MeasureStreamRegionLatencies(std::move(regions));
+                    client.MeasureStreamRegionLatencies(std::move(regions), session.provider.streaming_service_url);
                 client.SaveStreamRegionMeasurements(session, regions);
                 std::stable_sort(
                     regions.begin(),
@@ -1472,54 +1485,45 @@ bool SettingsTab::ChooseServerLocation(brls::View* view)
         return true;
     }
 
-    const auto best = std::find_if(
-        server_locations_.begin(),
-        server_locations_.end(),
-        [](const StreamRegion& region) { return region.ping_ms >= 0; });
-
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    const auto best_url = server_zone::Select(server_locations_, "Auto", now);
+    const auto closest_url = server_zone::Select(server_locations_, "Closest", now);
     std::vector<StreamRegion> options = server_locations_;
-    if (!server_location::IsAutomatic(draft_settings_.region))
-    {
-        const bool selected_available = std::any_of(
-            options.begin(),
-            options.end(),
-            [this](const StreamRegion& region) {
-                return region.url == draft_settings_.region;
-            });
-        if (!selected_available)
-        {
-            options.push_back(
-                {Tr("Current server (not advertised)"), draft_settings_.region, -1});
-        }
+    if (!server_location::IsAutomatic(draft_settings_.region) &&
+        std::none_of(options.begin(), options.end(), [this](const auto& r) { return r.url == draft_settings_.region; })) {
+        StreamRegion current;
+        current.name = Tr("Current server (not advertised)"); current.url = draft_settings_.region;
+        options.push_back(std::move(current));
     }
-
-    std::vector<std::string> labels;
-    labels.reserve(options.size() + 1);
-    std::string automatic = Tr("Auto (best)");
-    if (best != server_locations_.end())
-    {
-        automatic += " - " + best->name + " - " +
-            "~" + std::to_string(best->ping_ms) + " ms";
-    }
-    labels.push_back(std::move(automatic));
-
-    int selected_index = 0;
-    for (size_t index = 0; index < options.size(); ++index)
-    {
-        const StreamRegion& region = options[index];
+    std::stable_sort(options.begin(), options.end(), [](const auto& a, const auto& b) {
+        if (a.zone_id.empty() != b.zone_id.empty()) return !a.zone_id.empty();
+        if ((a.ping_ms >= 0) != (b.ping_ms >= 0)) return a.ping_ms >= 0;
+        if (a.ping_ms != b.ping_ms) return a.ping_ms < b.ping_ms;
+        return a.name < b.name;
+    });
+    auto recommendation = [&](const char* title, const std::string& url) {
+        std::string label = Tr(title);
+        const auto r = std::find_if(options.begin(), options.end(), [&](const auto& item) { return item.url == url; });
+        if (r != options.end()) label += " - " + r->name + " - ~" + std::to_string(r->ping_ms) + " ms";
+        return label;
+    };
+    std::vector<std::string> labels {
+        recommendation("Auto (best)", best_url), recommendation("Closest (lowest ping)", closest_url)};
+    int selected_index = server_location::IsClosest(draft_settings_.region) ? 1 : 0;
+    for (size_t i = 0; i < options.size(); ++i) {
+        const auto& region = options[i];
         std::string label = region.name;
-        if (region.ping_ms >= 0)
-            label += " - ~" + std::to_string(region.ping_ms) + " ms";
-        else if (server_locations_loading_)
-            label += " - " + Tr("Testing locations...");
-        else
-            label += " - " + Tr("Unavailable");
-        if (best != server_locations_.end() && region.url == best->url)
-            label += " - " + Tr("Best");
+        if (region.ping_ms >= 0) label += " - ~" + std::to_string(region.ping_ms) + " ms";
+        else label += " - " + Tr(server_locations_loading_ ? "Testing locations..." : "Unavailable");
+        if (!region.zone_id.empty()) {
+            label += " - " + (server_zone::FreshQueue(region, now)
+                ? TrFormat("Public queue ~{0}", {std::to_string(region.zone_queue_estimate)})
+                : Tr("Queue estimate unavailable"));
+        }
+        if (region.url == best_url) label += " - " + Tr("Best");
         labels.push_back(std::move(label));
-
-        if (region.url == draft_settings_.region)
-            selected_index = static_cast<int>(index + 1);
+        if (region.url == draft_settings_.region) selected_index = static_cast<int>(i + 2);
     }
 
     const std::shared_ptr<std::atomic_bool> alive = alive_;
@@ -1529,10 +1533,11 @@ bool SettingsTab::ChooseServerLocation(brls::View* view)
         [this, alive, options = std::move(options)](int index) {
             if (!alive->load(std::memory_order_acquire) || index < 0)
                 return;
-            draft_settings_.region =
-                index == 0 || static_cast<size_t>(index) > options.size()
-                ? "Auto"
-                : options[static_cast<size_t>(index - 1)].url;
+            if (index == 0) draft_settings_.region = "Auto";
+            else if (index == 1) draft_settings_.region = "Closest";
+            else if (static_cast<size_t>(index - 2) < options.size())
+                draft_settings_.region = options[static_cast<size_t>(index - 2)].url;
+            else return;
             MarkDirty();
             UpdateOptionValues();
         },
@@ -1548,213 +1553,6 @@ bool SettingsTab::RefreshServerLocations(brls::View* view)
     return true;
 }
 
-bool SettingsTab::CycleStreamPreset(brls::View* view)
-{
-    (void)view;
-    const bool audio_enabled = draft_settings_.audio_enabled;
-    const int audio_volume = draft_settings_.audio_volume;
-    const int audio_buffer_ms = draft_settings_.audio_buffer_ms;
-    const std::string backend = draft_settings_.video_backend;
-    const std::string region = draft_settings_.region;
-    const bool debug_diagnostics = draft_settings_.debug_diagnostics;
-    const std::string game_language = draft_settings_.game_language;
-    const bool persist_game_settings = draft_settings_.persist_game_settings;
-    const std::string controller_layout = draft_settings_.controller_layout;
-    const std::string image_quality_mode = draft_settings_.image_quality_mode;
-    const std::string interface_language = draft_settings_.interface_language;
-
-    draft_settings_ = NextStreamPreset(draft_settings_);
-    draft_settings_.audio_enabled = audio_enabled;
-    draft_settings_.audio_volume = audio_volume;
-    draft_settings_.audio_buffer_ms = audio_buffer_ms;
-    draft_settings_.video_backend = backend;
-    draft_settings_.region = region;
-    draft_settings_.debug_diagnostics = debug_diagnostics;
-    draft_settings_.game_language = game_language;
-    draft_settings_.persist_game_settings = persist_game_settings;
-    draft_settings_.controller_layout = controller_layout;
-    draft_settings_.image_quality_mode = image_quality_mode;
-    draft_settings_.interface_language = interface_language;
-    MarkDirty();
-    return true;
-}
-
-bool SettingsTab::ResetStreamPreset(brls::View* view)
-{
-    (void)view;
-
-    const std::string region = draft_settings_.region;
-    const bool audio_enabled = draft_settings_.audio_enabled;
-    const int audio_volume = draft_settings_.audio_volume;
-    const int audio_buffer_ms = draft_settings_.audio_buffer_ms;
-    const std::string backend = draft_settings_.video_backend;
-    const bool debug_diagnostics = draft_settings_.debug_diagnostics;
-    const std::string game_language = draft_settings_.game_language;
-    const bool persist_game_settings = draft_settings_.persist_game_settings;
-    const std::string controller_layout = draft_settings_.controller_layout;
-    const std::string image_quality_mode = draft_settings_.image_quality_mode;
-    const std::string interface_language = draft_settings_.interface_language;
-    draft_settings_ = StreamPresets()[1];
-    draft_settings_.region = region;
-    draft_settings_.audio_enabled = audio_enabled;
-    draft_settings_.audio_volume = audio_volume;
-    draft_settings_.audio_buffer_ms = audio_buffer_ms;
-    draft_settings_.video_backend = backend;
-    draft_settings_.debug_diagnostics = debug_diagnostics;
-    draft_settings_.game_language = game_language;
-    draft_settings_.persist_game_settings = persist_game_settings;
-    draft_settings_.controller_layout = controller_layout;
-    draft_settings_.image_quality_mode = image_quality_mode;
-    draft_settings_.interface_language = interface_language;
-    MarkDirty();
-    UpdateOptionValues();
-    brls::Application::notify("Balanced defaults staged; press X to save");
-    return true;
-}
-
-bool SettingsTab::CycleVideoBackend(brls::View* view)
-{
-    (void)view;
-    if (draft_settings_.video_backend == "Auto")
-        draft_settings_.video_backend = "NVDEC";
-    else if (draft_settings_.video_backend == "NVDEC")
-        draft_settings_.video_backend = "Software";
-    else
-        draft_settings_.video_backend = "Auto";
-    MarkDirty();
-    return true;
-}
-
-bool SettingsTab::CycleImageQuality(brls::View* view)
-{
-    (void)view;
-    settings::CycleImageQuality(draft_settings_);
-    MarkDirty();
-    return true;
-}
-
-bool SettingsTab::ChooseGameLanguage(brls::View* view)
-{
-    (void)view;
-    const auto& options = GameLanguageOptions();
-    std::vector<std::string> labels;
-    labels.reserve(options.size());
-    int selected = 0;
-    for (size_t index = 0; index < options.size(); ++index)
-    {
-        labels.push_back(options[index].label);
-        if (options[index].code == draft_settings_.game_language)
-            selected = static_cast<int>(index);
-    }
-
-    auto* dropdown = new brls::Dropdown(
-        "Game language", labels,
-        [this](int index) {
-            const auto& languages = GameLanguageOptions();
-            if (index < 0 || static_cast<size_t>(index) >= languages.size())
-                return;
-            draft_settings_.game_language = languages[static_cast<size_t>(index)].code;
-            MarkDirty();
-            UpdateOptionValues();
-        },
-        selected);
-    brls::Application::pushActivity(new brls::Activity(dropdown));
-    return true;
-}
-
-bool SettingsTab::ChooseInterfaceLanguage(brls::View* view)
-{
-    (void)view;
-    const auto& options = InterfaceLanguageOptions();
-    std::vector<std::string> labels;
-    labels.reserve(options.size());
-    int selected = 0;
-    for (size_t index = 0; index < options.size(); ++index)
-    {
-        labels.push_back(options[index].label);
-        if (options[index].code == draft_settings_.interface_language)
-            selected = static_cast<int>(index);
-    }
-
-    auto* dropdown = new brls::Dropdown(
-        Tr("Language"), labels,
-        [this](int index) {
-            const auto& languages = InterfaceLanguageOptions();
-            if (index < 0 || static_cast<size_t>(index) >= languages.size())
-                return;
-            draft_settings_.interface_language = languages[static_cast<size_t>(index)].code;
-            MarkDirty();
-            UpdateOptionValues();
-        },
-        selected);
-    brls::Application::pushActivity(new brls::Activity(dropdown));
-    return true;
-}
-
-bool SettingsTab::TogglePersistGameSettings(brls::View* view)
-{
-    (void)view;
-    draft_settings_.persist_game_settings = !draft_settings_.persist_game_settings;
-    MarkDirty();
-    return true;
-}
-
-bool SettingsTab::ToggleControllerLayout(brls::View* view)
-{
-    (void)view;
-    draft_settings_.controller_layout =
-        draft_settings_.controller_layout == "Switch" ? "Xbox" : "Switch";
-    MarkDirty();
-    return true;
-}
-
-bool SettingsTab::ToggleAudio(brls::View* view)
-{
-    (void)view;
-    draft_settings_.audio_enabled = !draft_settings_.audio_enabled;
-    MarkDirty();
-    return true;
-}
-
-bool SettingsTab::CycleAudioVolume(brls::View* view)
-{
-    (void)view;
-    constexpr int gains[] = {800, 1000, 1200, 1400, 1600};
-    int next_gain = gains[0];
-    for (int gain : gains)
-    {
-        if (gain > draft_settings_.audio_volume)
-        {
-            next_gain = gain;
-            break;
-        }
-    }
-    draft_settings_.audio_volume = next_gain;
-    MarkDirty();
-    return true;
-}
-
-bool SettingsTab::CycleAudioBuffer(brls::View* view)
-{
-    (void)view;
-    draft_settings_.audio_buffer_ms =
-        draft_settings_.audio_buffer_ms >= 100 ? 30 : draft_settings_.audio_buffer_ms + 10;
-    MarkDirty();
-    return true;
-}
-
-bool SettingsTab::ToggleDebugDiagnostics(brls::View* view)
-{
-    (void)view;
-    draft_settings_.debug_diagnostics = !draft_settings_.debug_diagnostics;
-    MarkDirty();
-    brls::Application::notify(
-        draft_settings_.debug_diagnostics
-            ? "Debug diagnostics staged; press X to save"
-            : "Clean stream mode staged; press X to save");
-    return true;
-}
-
 bool SettingsTab::ShowDiagnostics(brls::View* view)
 {
     (void)view;
@@ -1764,7 +1562,7 @@ bool SettingsTab::ShowDiagnostics(brls::View* view)
     const StreamSettings stream_settings = LoadStreamSettings();
     const std::string local_ip = NetworkUtils::GetLocalIPAddress();
 
-    std::string account = "not connected";
+    std::string account = Tr("not connected");
     std::string provider = "n/a";
     if (state.HasSession())
     {
@@ -1773,20 +1571,24 @@ bool SettingsTab::ShowDiagnostics(brls::View* view)
     }
 
     ShowDialog(
-        "Diagnostics",
-        "Applet type: " + AppletTypeName() + "\n" +
-            "Local IP: " + local_ip + "\n" +
-            "Account: " + account + "\n" +
-            "Provider: " + provider + "\n" +
-            "Providers cached: " + std::string(state.HasProviders() ? "yes" : "no") + "\n" +
-            "Public catalog entries: " + std::to_string(state.public_games().size()) + "\n" +
-            "Library entries: " + std::to_string(state.library_games().size()) + "\n" +
-            "Stream: " + FormatStreamSettings(stream_settings) + "\n" +
-            "Cover cache: " + std::to_string(images.files) + " files, " + FormatBytes(images.bytes) + "\n\n" +
-            "Paths:\n" +
+        opennow::Tr("Diagnostics"),
+        opennow::Tr("Applet type: ") + AppletTypeName() + "\n" +
+            opennow::Tr("Local IP: ") + local_ip + "\n" +
+            opennow::Tr("Account: ") + account + "\n" +
+            opennow::Tr("Provider: ") + provider + "\n" +
+            opennow::Tr("Providers cached: ") + std::string(state.HasProviders() ? opennow::Tr("yes") : opennow::Tr("no")) + "\n" +
+            opennow::Tr("Public catalog entries: ") + std::to_string(state.public_games().size()) + "\n" +
+            opennow::Tr("Library entries: ") + std::to_string(state.library_games().size()) + "\n" +
+            opennow::Tr("Stream: ") + (Tr(stream_settings.label)+" | "+std::to_string(stream_settings.width)+"x"+std::to_string(stream_settings.height)+
+                " | "+std::to_string(stream_settings.fps)+" FPS | "+std::to_string(stream_settings.bitrate_kbps/1000)+" Mbps | "+
+                Tr("Video backend")+": "+Tr(stream_settings.video_backend)+" | "+Tr("Region")+": "+Tr(stream_settings.region)+
+                " | "+Tr("Game language")+": "+Tr(GameLanguageLabel(stream_settings.game_language))+" | "+
+                Tr("Streaming mode")+": "+Tr(stream_settings.image_quality_mode)) + "\n" +
+            opennow::Tr("Cover cache: ") + std::to_string(images.files) + opennow::Tr(" files, ") + FormatBytes(images.bytes) + "\n\n" +
+            opennow::Tr("Paths:\n") +
             std::string(kAppHomePath) + "\n" +
             "boot.log: " + FileState(std::string(kAppHomePath) + "/boot.log") + "\n" +
-            "runtime.log (always on): " +
+            opennow::Tr("runtime.log (always on): ") +
                 FileState(std::string(kAppHomePath) + "/runtime.log") + "\n" +
             "auth.log: " + FileState(std::string(kAppHomePath) + "/auth.log") + "\n" +
             "input.log: " + FileState(std::string(kAppHomePath) + "/input.log") + "\n" +
@@ -1796,7 +1598,7 @@ bool SettingsTab::ShowDiagnostics(brls::View* view)
             "auth_accounts.json: " + FileState(std::string(kAppHomePath) + "/auth_accounts.json") + "\n" +
             "active_cloud_session.json: " + FileState(std::string(kAppHomePath) + "/active_cloud_session.json") + "\n" +
             "stream_settings.json: " + FileState(std::string(kAppHomePath) + "/stream_settings.json") + "\n\n" +
-            "Tip: NVIDIA login needs Application mode. If Applet type is not Application/SystemApplication, launch hbmenu with title override.");
+            opennow::Tr("Tip: NVIDIA login needs Application mode. If Applet type is not Application/SystemApplication, launch hbmenu with title override."));
     return true;
 }
 

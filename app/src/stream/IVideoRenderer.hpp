@@ -28,6 +28,14 @@ struct VideoRenderStats {
     uint64_t measurement_start_timestamp;
     uint32_t retained_surfaces;
     uint32_t surface_mappings;
+    uint64_t upload_count = 0;
+    uint64_t upload_cpu_us_total = 0;
+    uint64_t upload_cpu_us_max = 0;
+    uint64_t upload_memcpy_us_total = 0, upload_memcpy_us_max = 0;
+    uint64_t slot_fence_wait_us_total = 0, slot_fence_wait_us_max = 0;
+    uint64_t command_fence_wait_us_total = 0, command_fence_wait_us_max = 0;
+    uint64_t descriptor_updates = 0, update_submissions = 0;
+    bool immutable_upload_descriptors = false;
 };
 
 class IVideoRenderer {

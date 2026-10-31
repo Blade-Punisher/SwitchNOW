@@ -1,6 +1,9 @@
 #include "AudioPipeline.hpp"
 #include "AudioLatencyPolicy.hpp"
 #include "AudioRtpUtils.hpp"
+#include "AudioServiceDeadline.hpp"
+#include "AudioRecoveryPolicy.hpp"
+#include "AudioGainPolicy.hpp"
 #include "../../stream_diagnostics.hpp"
 
 #include "peer_connection.h"
@@ -28,9 +31,9 @@ constexpr int kMaxPackets = 12;
 constexpr int kOutputBufferCount = 24;
 constexpr size_t kOutputBufferBytes = 0x4000;
 constexpr int kOutputStartBuffers = 4;
-constexpr int kFadeSilenceFrames = 2400; // 50 ms
-constexpr int kFadeTotalFrames = 12000;  // 250 ms
-constexpr const char* kAudioLogPath = "sdmc:/switch/SwitchNOW/audio.log";
+constexpr int kFadeSilenceFrames = 480;  // 10 ms
+constexpr int kFadeTotalFrames = 4800;   // 100 ms
+constexpr int kConcealmentRecoveryFrames = 240; // 5 ms
 
 uint64_t monotonic_us() {
     return std::chrono::duration_cast<std::chrono::microseconds>(
@@ -54,10 +57,12 @@ struct AudioPipeline::Impl {
         uint16_t sequence = 0;
         uint8_t payload_type = 0;
         uint64_t arrival_us = 0;
+        uint64_t epoch = 0;
     };
 
     std::atomic<bool> running {false};
     std::atomic<bool> reset_epoch_requested {false};
+    std::atomic<uint64_t> media_epoch {0};
     std::atomic<uint64_t> last_receive_us {0};
     std::thread worker;
     mutable std::mutex mutex;
@@ -66,8 +71,11 @@ struct AudioPipeline::Impl {
     uint16_t expected_sequence = 0;
     bool have_expected = false;
     bool primed = false;
-    int volume_percent = 1200;
+    int volume_percent = 600;
     float applied_gain = 1.0f;
+    opennow::audio::GainEnvelope gain_envelope;
+    opennow::audio::ArrivalJitter arrival_jitter;
+    std::atomic<uint64_t> arrival_jitter_us {0}, start_target_ms {40};
     std::atomic<int> last_input_peak {0};
     std::atomic<int> last_input_rms {0};
     std::atomic<int> last_output_peak {0};
@@ -76,11 +84,23 @@ struct AudioPipeline::Impl {
     std::atomic<uint64_t> limited_frames {0};
     int prime_packets = kPrimePackets;
     int output_start_buffers = kOutputStartBuffers;
+    int maximum_output_start_buffers = kOutputStartBuffers + 2;
     int output_queue_limit = 8;
+    opennow::audio::ReserveRelease reserve_release;
+    opennow::audio::ShortGapReserve short_gap_reserve;
+    opennow::audio::EmptyQueueGrace empty_queue_grace;
+    uint64_t rebuffer_us_total = 0, rebuffer_us_max = 0;
+    uint64_t last_underrun_us = 0;
+    uint64_t underrun_episode_start_us = 0;
+    uint64_t underrun_restart_us = 0;
+    unsigned underruns_in_episode = 0;
     uint64_t initial_jitter_hold_us = 40000;
     uint64_t resync_jitter_hold_us = 30000;
     uint64_t jitter_hold_until_us = 0;
+    uint64_t missing_packet_since_us = 0;
     int fade_frames_processed = 0;
+    int concealment_recovery_frames_remaining = 0;
+    std::array<int16_t, kChannels> last_output_samples {};
 
     HwopusDecoder decoder {};
     bool decoder_ready = false;
@@ -91,16 +111,20 @@ struct AudioPipeline::Impl {
     };
     std::array<OutputSlot, kOutputBufferCount> output_slots {};
     std::atomic<bool> output_ready {false};
-    bool output_started = false;
+    std::atomic<bool> output_started {false};
     size_t queued_output_buffers = 0;
-    uint64_t played_sample_base = 0;
+    uint64_t last_raw_played_samples = 0;
+    uint64_t accumulated_played_samples = 0;
+    bool have_raw_played_samples = false;
     std::atomic<uint64_t> submitted_samples {0};
     std::atomic<uint64_t> played_samples {0};
+    std::atomic<uint64_t> played_samples_observed_at_us {0};
     std::atomic<uint64_t> base_timestamp {0};
     std::atomic<bool> have_base_timestamp {false};
     std::atomic<uint32_t> audio_ssrc {0};
-    std::atomic<uint64_t> sr_ntp_us {0};
-    std::atomic<uint32_t> sr_rtp_timestamp {0};
+    mutable std::mutex sender_report_mutex;
+    uint64_t sr_ntp_us = 0;
+    uint32_t sr_rtp_timestamp = 0;
     std::atomic<bool> have_sender_report {false};
 
     std::atomic<uint64_t> packets_rx {0};
@@ -114,22 +138,18 @@ struct AudioPipeline::Impl {
     std::atomic<uint64_t> decode_errors {0};
     std::atomic<uint64_t> plc_frames {0};
     std::atomic<uint64_t> underruns {0};
+    std::atomic<uint64_t> played_counter_resets {0};
+    std::atomic<uint64_t> output_queue_high_water {0};
     std::atomic<uint64_t> red_packets {0};
     std::atomic<uint64_t> red_recoveries {0};
     std::atomic<uint64_t> epoch_resets {0};
     uint64_t session_started_us = 0;
     uint64_t last_wait_log_us = 0;
-    mutable std::mutex log_mutex;
 
     void log(const std::string& message) {
         if (!opennow::StreamDiagnosticsEnabled())
             return;
-        std::lock_guard<std::mutex> lock(log_mutex);
-        FILE* file = std::fopen(kAudioLogPath, "a");
-        if (!file)
-            return;
-        std::fprintf(file, "%llu %s\n", static_cast<unsigned long long>(monotonic_us()), message.c_str());
-        std::fclose(file);
+        opennow::AppendAudioDiagnostic(std::to_string(monotonic_us()) + " " + message + "\n");
     }
 
     bool initialize_audio() {
@@ -173,8 +193,11 @@ struct AudioPipeline::Impl {
             slot.free = true;
         }
         u64 raw_played = 0;
-        if (R_SUCCEEDED(audoutGetAudioOutPlayedSampleCount(&raw_played)))
-            played_sample_base = raw_played;
+        if (R_SUCCEEDED(audoutGetAudioOutPlayedSampleCount(&raw_played))) {
+            last_raw_played_samples = raw_played;
+            accumulated_played_samples = 0;
+            have_raw_played_samples = true;
+        }
         output_ready.store(true);
         log("INIT ok backend=audout rate=48000 channels=2 frameSamples=480 prebuffer=" +
             std::to_string(prime_packets) + " buffers=24 outputLimit=" +
@@ -216,8 +239,25 @@ struct AudioPipeline::Impl {
         u64 raw_played = 0;
         if (R_FAILED(audoutGetAudioOutPlayedSampleCount(&raw_played)))
             return;
-        const uint64_t relative = raw_played >= played_sample_base ? raw_played - played_sample_base : raw_played;
-        played_samples.store(std::min(relative, submitted_samples.load()));
+        if (!have_raw_played_samples) {
+            last_raw_played_samples = raw_played;
+            have_raw_played_samples = true;
+        } else {
+            const bool counter_reset = raw_played < last_raw_played_samples;
+            accumulated_played_samples += opennow::audio::PlayedSampleDelta(
+                last_raw_played_samples, raw_played);
+            last_raw_played_samples = raw_played;
+            if (counter_reset) {
+                const uint64_t resets = played_counter_resets.fetch_add(1) + 1;
+                log("AUDOUT played_counter_reset raw=" + std::to_string(raw_played) +
+                    " accumulated=" + std::to_string(accumulated_played_samples) +
+                    " count=" + std::to_string(resets));
+            }
+        }
+        played_samples.store(
+            std::min(accumulated_played_samples, submitted_samples.load()),
+            std::memory_order_relaxed);
+        played_samples_observed_at_us.store(monotonic_us(), std::memory_order_release);
     }
 
     void reclaim_output_buffers() {
@@ -237,6 +277,77 @@ struct AudioPipeline::Impl {
             released_count = 0;
         }
         refresh_played_samples();
+        const auto received_us = last_receive_us.load(std::memory_order_acquire);
+        const auto checked_us = monotonic_us();
+        if (!received_us || checked_us < received_us || checked_us - received_us >= 150000)
+            reserve_release = {}; // silence is not evidence of stable low jitter
+        if (output_started && queued_output_buffers > 0 && empty_queue_grace.began_us) {
+            AudioOutState state = AudioOutState_Started;
+            if (R_SUCCEEDED(audoutGetAudioOutState(&state)) && state == AudioOutState_Stopped) {
+                if (R_FAILED(audoutStartAudioOut())) {
+                    output_started = false;
+                    underrun_restart_us = checked_us;
+                    log("AUDOUT soft_resume_start_failed; using normal priming");
+                }
+            }
+            if (output_started) empty_queue_grace.Filled(checked_us);
+            else empty_queue_grace.Reprimed();
+        }
+        if (output_started && queued_output_buffers == 0) {
+            const auto media_gap = received_us && checked_us >= received_us
+                ? (checked_us - received_us) / 1000 : 150;
+            const auto grace_us = opennow::audio::EmptyGraceBudgetUs(
+                arrival_jitter_us.load(std::memory_order_relaxed), media_gap, underruns_in_episode);
+            if (!empty_queue_grace.MustReprime(checked_us, grace_us)) return;
+            empty_queue_grace.Reprimed();
+            (void)audoutStopAudioOut();
+            output_started = false;
+            const uint64_t now_us = monotonic_us();
+            const uint64_t media_us = last_receive_us.load(std::memory_order_acquire);
+            const uint64_t media_gap_ms = media_us && now_us >= media_us
+                ? (now_us - media_us) / 1000 : 0;
+            if (!opennow::audio::RecentUnderrun(now_us, last_underrun_us)) {
+                underrun_episode_start_us = now_us;
+                underruns_in_episode = 0;
+            }
+            ++underruns_in_episode;
+            last_underrun_us = now_us;
+            underrun_restart_us = now_us;
+            const uint64_t count = underruns.fetch_add(1) + 1;
+            short_gap_reserve.Observe(now_us, media_gap_ms, prime_packets);
+            output_start_buffers = opennow::audio::RecoveryReserve(
+                output_start_buffers, prime_packets, maximum_output_start_buffers, underruns_in_episode,
+                arrival_jitter_us.load(std::memory_order_relaxed), media_gap_ms);
+            const int demand = short_gap_reserve.Demand(now_us, prime_packets, maximum_output_start_buffers,
+                opennow::audio::RecoveryReserve(prime_packets, prime_packets,
+                    maximum_output_start_buffers, underruns_in_episode,
+                    arrival_jitter_us.load(std::memory_order_relaxed), media_gap_ms));
+            if (media_gap_ms < 150) output_start_buffers = std::max(output_start_buffers, demand);
+            if (media_gap_ms < 150)
+                output_start_buffers = reserve_release.Observe(now_us, output_start_buffers, demand);
+            else reserve_release = {};
+            start_target_ms.store(output_start_buffers * 10, std::memory_order_relaxed);
+            log("AUDOUT underrun; re-priming output count=" + std::to_string(count) +
+                " emptyGraceUs=" + std::to_string(grace_us) +
+                " nextPrebuffer=" + std::to_string(output_start_buffers) +
+                " mediaGapMs=" + std::to_string(media_gap_ms) +
+                " arrivalJitterUs=" + std::to_string(arrival_jitter_us.load()) +
+                " episodeCount=" + std::to_string(underruns_in_episode) +
+                " shortGapReserve=" + std::to_string(short_gap_reserve.Demand(now_us, prime_packets,
+                    maximum_output_start_buffers, prime_packets) - prime_packets));
+        } else if (output_started && output_start_buffers > prime_packets) {
+            // Lower only the next priming target: never discard live PCM or
+            // jump the playback clock just to reduce the protection reserve.
+            const int demand = short_gap_reserve.Demand(monotonic_us(), prime_packets, maximum_output_start_buffers,
+                opennow::audio::RecoveryReserve(prime_packets, prime_packets,
+                    maximum_output_start_buffers, underruns_in_episode, arrival_jitter_us.load(), 0));
+            const int reduced = reserve_release.Observe(monotonic_us(), output_start_buffers, demand);
+            if (reduced != output_start_buffers) {
+                output_start_buffers = reduced;
+                start_target_ms.store(output_start_buffers * 10, std::memory_order_relaxed);
+                log("AUDOUT stable_jitter nextPrebuffer=" + std::to_string(output_start_buffers));
+            }
+        }
     }
 
     OutputSlot* acquire_output_slot() {
@@ -248,7 +359,9 @@ struct AudioPipeline::Impl {
     }
 
     bool ensure_output_started() {
-        if (output_started || queued_output_buffers < static_cast<size_t>(output_start_buffers))
+        if (output_started || !opennow::audio::CanRestartOutput(
+                queued_output_buffers, output_start_buffers, prime_packets,
+                monotonic_us(), underrun_restart_us))
             return true;
         const Result rc = audoutStartAudioOut();
         if (R_FAILED(rc)) {
@@ -256,7 +369,15 @@ struct AudioPipeline::Impl {
             return false;
         }
         output_started = true;
-        log("AUDOUT started queued=" + std::to_string(queued_output_buffers));
+        if (underrun_restart_us && monotonic_us() >= underrun_restart_us) {
+            const auto duration = monotonic_us() - underrun_restart_us;
+            rebuffer_us_total += duration; rebuffer_us_max = std::max(rebuffer_us_max, duration);
+        }
+        log("AUDOUT started queued=" + std::to_string(queued_output_buffers) +
+            " recoveryMs=" + std::to_string(underrun_restart_us &&
+                monotonic_us() >= underrun_restart_us
+                    ? (monotonic_us() - underrun_restart_us) / 1000 : 0));
+        underrun_restart_us = 0;
         return true;
     }
 
@@ -307,6 +428,12 @@ struct AudioPipeline::Impl {
             }
             slot->free = false;
             ++queued_output_buffers;
+            uint64_t observed_high_water =
+                output_queue_high_water.load(std::memory_order_relaxed);
+            while (observed_high_water < queued_output_buffers &&
+                   !output_queue_high_water.compare_exchange_weak(
+                       observed_high_water, queued_output_buffers,
+                       std::memory_order_relaxed)) {}
             const uint64_t frame_count = copy_size / (kChannels * sizeof(int16_t));
             submitted_samples.fetch_add(frame_count);
             if (decode_attempts.load() <= 12)
@@ -321,8 +448,18 @@ struct AudioPipeline::Impl {
     }
 
     void submit_plc() {
-        std::array<int16_t, kFrameSamples * kChannels> silence {};
-        submit_pcm(silence.data(), kFrameSamples);
+        std::array<int16_t, kFrameSamples * kChannels> concealment {};
+        for (int frame = 0; frame < kFrameSamples; ++frame) {
+            const float envelope = static_cast<float>(kFrameSamples - frame - 1) /
+                                   static_cast<float>(kFrameSamples);
+            for (int channel = 0; channel < kChannels; ++channel) {
+                concealment[frame * kChannels + channel] = static_cast<int16_t>(
+                    std::lround(static_cast<float>(last_output_samples[channel]) * envelope));
+            }
+        }
+        last_output_samples.fill(0);
+        concealment_recovery_frames_remaining = kConcealmentRecoveryFrames;
+        submit_pcm(concealment.data(), kFrameSamples);
         plc_frames++;
     }
 
@@ -339,22 +476,23 @@ struct AudioPipeline::Impl {
         }
 
         const float requested_gain = static_cast<float>(volume_percent) / 100.0f;
-        float safe_gain = requested_gain;
-        if (input_peak > 0 && requested_gain > 1.0f)
-            safe_gain = std::min(requested_gain, 30000.0f / static_cast<float>(input_peak));
-
-        // Fast attack prevents clipping; slower release avoids audible pumping.
-        if (safe_gain < applied_gain)
-            applied_gain = safe_gain;
-        else
-            applied_gain += (safe_gain - applied_gain) * 0.08f;
-        applied_gain = std::max(0.0f, std::min(requested_gain, applied_gain));
-        if (safe_gain + 0.01f < requested_gain)
+        const float gain_at_block_start = applied_gain;
+        applied_gain = gain_envelope.Update(input_peak, requested_gain,
+            static_cast<unsigned>(sample_count / kChannels));
+        if (applied_gain + 0.01f < requested_gain)
             limited_frames++;
 
         int output_peak = 0;
         uint64_t output_square_sum = 0;
         for (int i = 0; i < sample_count; ++i) {
+            const int frame_in_block = i / kChannels;
+            const int frames_in_block = std::max(1, sample_count / kChannels);
+            const float gain_progress = static_cast<float>(frame_in_block + 1) /
+                                        static_cast<float>(frames_in_block);
+            const float sample_gain = applied_gain < gain_at_block_start
+                ? applied_gain
+                : gain_at_block_start +
+                      (applied_gain - gain_at_block_start) * gain_progress;
             float fade = 1.0f;
             if (fade_frames_processed < kFadeTotalFrames) {
                 const int frame = fade_frames_processed + i / kChannels;
@@ -365,8 +503,17 @@ struct AudioPipeline::Impl {
                                               static_cast<float>(kFadeTotalFrames - kFadeSilenceFrames));
                 }
             }
+            if (concealment_recovery_frames_remaining > 0) {
+                const int recovery_progress =
+                    kConcealmentRecoveryFrames -
+                    concealment_recovery_frames_remaining + frame_in_block;
+                fade *= std::clamp(
+                    static_cast<float>(recovery_progress + 1) /
+                        static_cast<float>(kConcealmentRecoveryFrames),
+                    0.0f, 1.0f);
+            }
             int32_t amplified = static_cast<int32_t>(
-                std::lround(static_cast<float>(pcm[i]) * applied_gain * fade));
+                std::lround(static_cast<float>(pcm[i]) * sample_gain * fade));
             amplified = std::max<int32_t>(-32768, std::min<int32_t>(32767, amplified));
             pcm[i] = static_cast<int16_t>(amplified);
             output_peak = std::max(output_peak, std::abs(static_cast<int>(pcm[i])));
@@ -374,6 +521,12 @@ struct AudioPipeline::Impl {
         }
         fade_frames_processed = std::min(kFadeTotalFrames,
                                          fade_frames_processed + sample_count / kChannels);
+        concealment_recovery_frames_remaining = std::max(
+            0, concealment_recovery_frames_remaining - sample_count / kChannels);
+        if (sample_count >= kChannels) {
+            for (int channel = 0; channel < kChannels; ++channel)
+                last_output_samples[channel] = pcm[sample_count - kChannels + channel];
+        }
 
         const int input_rms = static_cast<int>(std::sqrt(
             static_cast<double>(input_square_sum) / static_cast<double>(sample_count)));
@@ -407,9 +560,9 @@ struct AudioPipeline::Impl {
             decoder_ready = R_SUCCEEDED(hwopusDecoderInitialize(&decoder, kSampleRate, kChannels));
         }
         have_base_timestamp.store(false);
-        have_sender_report.store(false);
-        applied_gain = 0.0f;
         fade_frames_processed = 0;
+        concealment_recovery_frames_remaining = 0;
+        last_output_samples.fill(0);
         epoch_resets++;
         log("EPOCH reset reason=" + std::string(reason ? reason : "transport_gap") +
             " count=" + std::to_string(epoch_resets.load()) +
@@ -495,33 +648,62 @@ struct AudioPipeline::Impl {
 
     bool take_next(Packet& packet) {
         std::unique_lock<std::mutex> lock(mutex);
-        cv.wait_for(lock, std::chrono::milliseconds(12), [this] {
-            const bool hold_finished = jitter_hold_until_us == 0 || monotonic_us() >= jitter_hold_until_us;
-            return !running.load() || (!packets.empty() && hold_finished &&
-                                       (primed || packets.size() >= static_cast<size_t>(prime_packets)));
-        });
-        if (!running.load())
-            return false;
-        if (!primed && packets.size() >= static_cast<size_t>(prime_packets)) {
-            primed = true;
-            expected_sequence = packets.front().sequence;
-            have_expected = true;
-            jitter_hold_until_us = 0;
-            log("JITTER primed packets=" + std::to_string(packets.size()) +
-                " seq=" + std::to_string(expected_sequence));
-        }
-        if (!primed || packets.empty())
-            return false;
+        const opennow::audio::ServiceDeadline deadline(monotonic_us());
+        for (;;) {
+            // Return to the output service even when RTP has stopped. Reset
+            // must be consumed before extracting a packet of the new epoch.
+            const uint64_t now_us = monotonic_us();
+            if (deadline.ShouldService(now_us, running.load(), reset_epoch_requested.load()))
+                return false;
+            const bool hold_finished =
+                jitter_hold_until_us == 0 || now_us >= jitter_hold_until_us;
+            if (packets.empty() || !hold_finished ||
+                (!primed && packets.size() < static_cast<size_t>(prime_packets))) {
+                uint64_t wait_us = deadline.WaitUs(now_us, 12000);
+                if (!hold_finished)
+                    wait_us = std::min(wait_us, jitter_hold_until_us - now_us);
+                cv.wait_for(lock, std::chrono::microseconds(wait_us));
+                continue;
+            }
 
-        auto found = std::find_if(packets.begin(), packets.end(), [this](const Packet& item) {
-            return item.sequence == expected_sequence;
-        });
-        if (found == packets.end()) {
+            if (!primed) {
+                primed = true;
+                expected_sequence = packets.front().sequence;
+                have_expected = true;
+                jitter_hold_until_us = 0;
+                missing_packet_since_us = 0;
+                log("JITTER primed packets=" + std::to_string(packets.size()) +
+                    " seq=" + std::to_string(expected_sequence));
+            }
+
+            while (!packets.empty() &&
+                   static_cast<int16_t>(packets.front().sequence - expected_sequence) < 0) {
+                packets.pop_front();
+                late_drops++;
+            }
+            if (packets.empty()) {
+                missing_packet_since_us = 0;
+                continue;
+            }
+
+            auto found = std::find_if(packets.begin(), packets.end(), [this](const Packet& item) {
+                return item.sequence == expected_sequence;
+            });
+            if (found != packets.end()) {
+                packet = std::move(*found);
+                packets.erase(found);
+                expected_sequence++;
+                missing_packet_since_us = 0;
+                return true;
+            }
+
             auto next = std::find_if(packets.begin(), packets.end(), [this](const Packet& item) {
-                return item.sequence == static_cast<uint16_t>(expected_sequence + 1) && item.payload_type == 63;
+                return item.sequence == static_cast<uint16_t>(expected_sequence + 1) &&
+                       item.payload_type == 63;
             });
             if (next != packets.end()) {
-                const auto redundant = opennow::audio::ParseFirstRedundant(next->payload.data(), next->payload.size());
+                const auto redundant = opennow::audio::ParseFirstRedundant(
+                    next->payload.data(), next->payload.size());
                 if (redundant.data && redundant.size > 0) {
                     packet.payload.assign(redundant.data, redundant.data + redundant.size);
                     packet.timestamp = next->timestamp - redundant.timestamp_offset;
@@ -529,19 +711,30 @@ struct AudioPipeline::Impl {
                     packet.sequence = expected_sequence;
                     packet.payload_type = 111;
                     packet.arrival_us = next->arrival_us;
+                    packet.epoch = next->epoch;
                     expected_sequence++;
+                    missing_packet_since_us = 0;
                     red_recoveries++;
                     return true;
                 }
             }
+
+            if (missing_packet_since_us == 0)
+                missing_packet_since_us = now_us;
+            const uint64_t missing_us = now_us - missing_packet_since_us;
+            const uint64_t grace_us = opennow::audio::PacketReorderGraceUs();
+            if (missing_us < grace_us) {
+                cv.wait_for(lock, std::chrono::microseconds(deadline.WaitUs(
+                    now_us, grace_us - missing_us)));
+                continue;
+            }
+
             sequence_gaps++;
             expected_sequence++;
+            missing_packet_since_us = 0;
+            packet.epoch = media_epoch.load();
             return true; // Empty payload means PLC.
         }
-        packet = std::move(*found);
-        packets.erase(found);
-        expected_sequence++;
-        return true;
     }
 
     void run() {
@@ -557,8 +750,10 @@ struct AudioPipeline::Impl {
                 reset_media_epoch("transport_gap");
             Packet packet;
             if (!take_next(packet)) {
-                if (output_ready.load())
+                if (output_ready.load()) {
                     reclaim_output_buffers();
+                    (void)ensure_output_started();
+                }
                 const uint64_t now_us = monotonic_us();
                 if (packets_rx.load() == 0 && now_us - last_wait_log_us >= 5000000) {
                     log("WAIT no_audio_rtp elapsedMs=" +
@@ -567,6 +762,10 @@ struct AudioPipeline::Impl {
                 }
                 continue;
             }
+            // A producer may announce a new SSRC while we were extracting.
+            // Never feed a stale packet into the fresh decoder epoch.
+            if (packet.epoch != media_epoch.load() || reset_epoch_requested.load())
+                continue;
             if (packet.payload.empty())
                 submit_plc();
             else
@@ -582,6 +781,11 @@ struct AudioPipeline::Impl {
             " errors=" + std::to_string(decode_errors.load()) +
             " plc=" + std::to_string(plc_frames.load()) +
             " underruns=" + std::to_string(underruns.load()) +
+            " softEmptyResumes=" + std::to_string(empty_queue_grace.resumed) +
+            " softEmptyUs/Max=" + std::to_string(empty_queue_grace.silence_us) + "/" + std::to_string(empty_queue_grace.maximum_us) +
+            " rebufferUs/Max=" + std::to_string(rebuffer_us_total) + "/" + std::to_string(rebuffer_us_max) +
+            " playedCounterResets=" + std::to_string(played_counter_resets.load()) +
+            " outputQueueHigh=" + std::to_string(output_queue_high_water.load()) +
             " red/recovered=" + std::to_string(red_packets.load()) + "/" +
             std::to_string(red_recoveries.load()) +
             " epochResets=" + std::to_string(epoch_resets.load()) +
@@ -599,13 +803,15 @@ AudioPipeline::AudioPipeline() : impl_(std::make_unique<Impl>()) {}
 AudioPipeline::~AudioPipeline() { stop(); }
 
 void AudioPipeline::configure(int volume_percent, int target_buffer_ms) {
-    impl_->volume_percent = std::max(800, std::min(1600, volume_percent));
+    impl_->volume_percent = opennow::audio::ClampVolumeBoostPercent(volume_percent);
     impl_->prime_packets = opennow::audio::PrimePacketCount(target_buffer_ms);
     impl_->output_start_buffers = impl_->prime_packets;
+    impl_->start_target_ms.store(impl_->output_start_buffers * 10);
+    impl_->maximum_output_start_buffers =
+        opennow::audio::MaximumAdaptiveStartBuffers(target_buffer_ms);
     impl_->initial_jitter_hold_us = opennow::audio::InitialJitterHoldUs(target_buffer_ms);
     impl_->resync_jitter_hold_us = opennow::audio::ResyncJitterHoldUs(target_buffer_ms);
-    impl_->output_queue_limit = std::max(impl_->output_start_buffers,
-        std::min(12, impl_->prime_packets + 2));
+    impl_->output_queue_limit = opennow::audio::OutputQueueLimit(target_buffer_ms);
 }
 
 bool AudioPipeline::start() {
@@ -613,18 +819,33 @@ bool AudioPipeline::start() {
         return true;
     if (impl_->worker.joinable())
         impl_->worker.join();
+    impl_->output_start_buffers = impl_->prime_packets;
+    impl_->start_target_ms.store(impl_->output_start_buffers * 10);
+    impl_->last_underrun_us = impl_->underrun_episode_start_us = impl_->underrun_restart_us = 0;
+    impl_->reserve_release = {};
+    impl_->short_gap_reserve = {};
+    impl_->empty_queue_grace = {};
+    impl_->rebuffer_us_total = impl_->rebuffer_us_max = 0;
+    impl_->underruns_in_episode = 0;
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         impl_->packets.clear();
+        impl_->arrival_jitter = {};
+        impl_->arrival_jitter_us.store(0);
         impl_->expected_sequence = 0;
         impl_->have_expected = false;
         impl_->primed = false;
         impl_->jitter_hold_until_us = 0;
+        impl_->missing_packet_since_us = 0;
     }
     impl_->reset_epoch_requested.store(false);
     impl_->last_receive_us.store(0);
     impl_->submitted_samples.store(0);
     impl_->played_samples.store(0);
+    impl_->played_samples_observed_at_us.store(0);
+    impl_->last_raw_played_samples = 0;
+    impl_->accumulated_played_samples = 0;
+    impl_->have_raw_played_samples = false;
     impl_->base_timestamp.store(0);
     impl_->have_base_timestamp.store(false);
     impl_->audio_ssrc.store(0);
@@ -640,11 +861,16 @@ bool AudioPipeline::start() {
     impl_->decode_errors.store(0);
     impl_->plc_frames.store(0);
     impl_->underruns.store(0);
+    impl_->played_counter_resets.store(0);
+    impl_->output_queue_high_water.store(0);
     impl_->red_packets.store(0);
     impl_->red_recoveries.store(0);
     impl_->epoch_resets.store(0);
-    impl_->applied_gain = 0.0f;
+    impl_->applied_gain = static_cast<float>(impl_->volume_percent) / 100.0f;
+    impl_->gain_envelope = {impl_->applied_gain, 0};
     impl_->fade_frames_processed = 0;
+    impl_->concealment_recovery_frames_remaining = 0;
+    impl_->last_output_samples.fill(0);
     impl_->last_input_peak.store(0);
     impl_->last_input_rms.store(0);
     impl_->last_output_peak.store(0);
@@ -652,8 +878,6 @@ bool AudioPipeline::start() {
     impl_->last_applied_gain_x100.store(0);
     impl_->limited_frames.store(0);
     impl_->running.store(true);
-    if (opennow::StreamDiagnosticsEnabled())
-        std::remove(kAudioLogPath);
     impl_->log("SESSION start");
     impl_->worker = std::thread(&Impl::run, impl_.get());
     return true;
@@ -675,7 +899,12 @@ void AudioPipeline::stop() {
 void AudioPipeline::submit(const PeerAudioPacket& source) {
     if (!impl_->running.load() || !source.data || source.size == 0)
         return;
-    impl_->audio_ssrc.store(source.ssrc);
+    const uint32_t previous_ssrc = impl_->audio_ssrc.exchange(source.ssrc);
+    const bool ssrc_changed = previous_ssrc != 0 && previous_ssrc != source.ssrc;
+    if (ssrc_changed) {
+        impl_->have_sender_report.store(false, std::memory_order_release);
+        impl_->have_base_timestamp.store(false, std::memory_order_release);
+    }
     const uint64_t now_us = monotonic_us();
     const uint64_t previous_receive_us = impl_->last_receive_us.exchange(now_us);
     Impl::Packet packet;
@@ -688,6 +917,17 @@ void AudioPipeline::submit(const PeerAudioPacket& source) {
     impl_->packets_rx++;
 
     std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (ssrc_changed) {
+        impl_->packets.clear();
+        impl_->arrival_jitter = {};
+        impl_->arrival_jitter_us.store(0);
+        impl_->primed = false;
+        impl_->have_expected = false;
+        impl_->missing_packet_since_us = 0;
+        impl_->jitter_hold_until_us = now_us + impl_->resync_jitter_hold_us;
+        impl_->reset_epoch_requested.store(true);
+        impl_->media_epoch.fetch_add(1);
+    }
     if (impl_->jitter_hold_until_us == 0 && !impl_->primed)
         impl_->jitter_hold_until_us = now_us + impl_->initial_jitter_hold_us;
     if (opennow::audio::ShouldResetEpoch(previous_receive_us, now_us, impl_->have_expected,
@@ -695,13 +935,24 @@ void AudioPipeline::submit(const PeerAudioPacket& source) {
         impl_->packets.clear();
         impl_->primed = false;
         impl_->have_expected = false;
+        impl_->missing_packet_since_us = 0;
         impl_->jitter_hold_until_us = now_us + impl_->resync_jitter_hold_us;
         impl_->reset_epoch_requested.store(true);
+        impl_->media_epoch.fetch_add(1);
     }
+    packet.epoch = impl_->media_epoch.load();
     if (impl_->have_expected && int16_t(packet.sequence - impl_->expected_sequence) < 0) {
         impl_->late_drops++;
         return;
     }
+    const auto duplicate = std::find_if(
+        impl_->packets.begin(), impl_->packets.end(), [&packet](const Impl::Packet& item) {
+            return item.ssrc == packet.ssrc && item.sequence == packet.sequence;
+        });
+    if (duplicate != impl_->packets.end())
+        return;
+    impl_->arrival_jitter.Observe(packet.sequence, packet.timestamp, packet.arrival_us);
+    impl_->arrival_jitter_us.store(impl_->arrival_jitter.jitter_us, std::memory_order_relaxed);
     if (impl_->packets.size() >= kMaxPackets) {
         impl_->packets.pop_front();
         impl_->queue_drops++;
@@ -716,20 +967,42 @@ void AudioPipeline::submit(const PeerAudioPacket& source) {
 void AudioPipeline::set_sender_report(uint32_t ssrc, uint64_t ntp_us, uint32_t rtp_timestamp) {
     if (impl_->audio_ssrc.load() == 0 || impl_->audio_ssrc.load() != ssrc)
         return;
-    impl_->sr_ntp_us.store(ntp_us);
-    impl_->sr_rtp_timestamp.store(rtp_timestamp);
-    impl_->have_sender_report.store(true);
+    {
+        std::lock_guard<std::mutex> lock(impl_->sender_report_mutex);
+        if (impl_->audio_ssrc.load() != ssrc)
+            return;
+        impl_->sr_ntp_us = ntp_us;
+        impl_->sr_rtp_timestamp = rtp_timestamp;
+        impl_->have_sender_report.store(true, std::memory_order_release);
+    }
     impl_->log("RTCP_SR ssrc=" + std::to_string(ssrc) + " ntpUs=" + std::to_string(ntp_us) +
                " rtp=" + std::to_string(rtp_timestamp));
 }
 
 int64_t AudioPipeline::playback_ntp_us() const {
-    if (!impl_->output_ready.load() || !impl_->have_base_timestamp.load() || !impl_->have_sender_report.load())
+    if (!impl_->output_ready.load() || !impl_->have_base_timestamp.load() ||
+        !impl_->have_sender_report.load(std::memory_order_acquire))
         return -1;
-    const uint64_t played = impl_->played_samples.load();
+    // A dropped decoded block creates a discontinuity between the physical
+    // sample counter and RTP content. Fall back to R5's source pacing instead
+    // of feeding an increasingly wrong audio deadline to video presentation.
+    if (impl_->queue_drops.load(std::memory_order_relaxed) != 0)
+        return -1;
+    const uint64_t observed_at_us =
+        impl_->played_samples_observed_at_us.load(std::memory_order_acquire);
+    const uint64_t clock_us = impl_->output_started.load(std::memory_order_acquire)
+        ? monotonic_us() : observed_at_us;
+    const uint64_t played = opennow::audio::EstimatePlayedSamples(
+        impl_->played_samples.load(std::memory_order_relaxed), observed_at_us,
+        clock_us, impl_->submitted_samples.load(std::memory_order_relaxed),
+        kSampleRate);
     const uint32_t playback_rtp = static_cast<uint32_t>(impl_->base_timestamp.load() + played);
-    return static_cast<int64_t>(impl_->sr_ntp_us.load()) +
-           opennow::audio::RtpDeltaToUs(playback_rtp, impl_->sr_rtp_timestamp.load(), kSampleRate);
+    std::lock_guard<std::mutex> lock(impl_->sender_report_mutex);
+    if (!impl_->have_sender_report.load(std::memory_order_acquire))
+        return -1;
+    return static_cast<int64_t>(impl_->sr_ntp_us) +
+           opennow::audio::RtpDeltaToUs(
+               playback_rtp, impl_->sr_rtp_timestamp, kSampleRate);
 }
 
 std::string AudioPipeline::debug_info() const {
@@ -762,4 +1035,20 @@ std::string AudioPipeline::debug_info() const {
         static_cast<double>(impl_->last_applied_gain_x100.load()) / 100.0,
         static_cast<unsigned long long>(impl_->limited_frames.load()));
     return text;
+}
+
+AudioPerformanceCounters AudioPipeline::performance() const {
+    AudioPerformanceCounters result;
+    if (!impl_) return result;
+    result.plc = impl_->plc_frames.load(std::memory_order_relaxed);
+    result.underruns = impl_->underruns.load(std::memory_order_relaxed);
+    result.errors = impl_->decode_errors.load(std::memory_order_relaxed);
+    result.arrival_jitter_us = impl_->arrival_jitter_us.load(std::memory_order_relaxed);
+    result.start_target_ms = impl_->start_target_ms.load(std::memory_order_relaxed);
+    result.limited_blocks = impl_->limited_frames.load(std::memory_order_relaxed);
+    result.gain_x100 = impl_->last_applied_gain_x100.load(std::memory_order_relaxed);
+    const auto played = impl_->played_samples.load(std::memory_order_relaxed);
+    const auto submitted = impl_->submitted_samples.load(std::memory_order_relaxed);
+    result.queued_ms = submitted > played ? (submitted - played) * 1000 / kSampleRate : 0;
+    return result;
 }
